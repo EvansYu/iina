@@ -133,3 +133,44 @@ IINA is always looking for contributions, whether it's through bug reports, code
 > 💡 **Want to build your own plugin?**
 >
 > Explore the existing plugins listed here to learn how they work. If you create a new plugin or improve an existing one, feel free to contribute back by adding it to this list via a pull request.
+
+
+## Developer architecture and agent navigation
+
+This checkout uses Swift (language mode 5.0), AppKit, Objective-C/C bridges,
+libmpv/FFmpeg, Xcode and Swift Package Manager. The current
+[deployment configuration](Configs/Deployment.xcconfig) targets macOS 12;
+this differs from the older macOS 11.0+ feature summary above.
+
+The existing CI builds with the following command after dependency preparation:
+
+```sh
+xcodebuild -project iina.xcodeproj ONLY_ACTIVE_ARCH=NO -scheme iina -derivedDataPath . -configuration Nightly
+```
+
+See [CI](.github/workflows/ci.yml) for its Xcode selection and
+[the spelling workflow](.github/workflows/spelling.yml) for the spelling check.
+No automated test command or XCTest target was identified during initialization.
+A full Xcode installation and the native dependencies are needed to validate a build.
+
+The following relationships are confirmed by AppDelegate open actions,
+PlayerCore initialization and loadfile dispatch, MPVController initialization,
+and the architecture rules in [CONTRIBUTING.md](CONTRIBUTING.md#architecture):
+
+```mermaid
+flowchart LR
+    A["AppDelegate"] --> B["PlayerCore"]
+    B --> C["MainWindowController"]
+    B --> D["MPVController"]
+    C --> E["VideoView"]
+    D --> F["libmpv"]
+    E --> F
+```
+
+| Document | Purpose |
+| --- | --- |
+| [GLOBAL_AGENTS.md](GLOBAL_AGENTS.md) | Shared collaboration rules and skill routing |
+| [AGENTS.md](AGENTS.md) | Codex project entry |
+| [CLAUDE.md](CLAUDE.md) | Claude Code project entry |
+| [Project CodeMap](mydocs/codemap/2026-10-13_00-23_iina项目总图.md) | Source-linked module and capability navigation |
+| [Mermaid rules](docs/knowledge/mermaid-rules.md) | Diagram conventions and self-checks |

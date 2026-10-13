@@ -353,9 +353,6 @@ class Titlebar: NSView {
       item.title = FileManager.default.displayName(atPath: pathURL.path)
       item.image = NSWorkspace.shared.icon(forFile: pathURL.path)
       item.image?.size = NSSize(width: 16, height: 16)
-      if #available(macOS 27.0, *) {
-        item.preferredImageVisibility = .visible
-      }
       // Choosing a folder reveals the next path component in it; the document itself does nothing.
       if index > 0 {
         item.representedObject = components[index - 1]

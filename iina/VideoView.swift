@@ -53,7 +53,8 @@ class VideoView: NSView {
   }
 
   override var isOpaque: Bool {
-    return true
+    // oona: gpu-next 自建窗口模式下，此视图必须透明，以透出下层子窗口中的视频画面。
+    return !MPVController.useGPUNextOwnWindow
   }
 
   // MARK: - Init
@@ -63,10 +64,16 @@ class VideoView: NSView {
     super.init(frame: frame)
 
     // set up layer
-    layer = videoLayer
-    videoLayer.colorspace = VideoView.SRGB
-    videoLayer.contentsScale = NSScreen.main!.backingScaleFactor
-    wantsLayer = true
+    if MPVController.useGPUNextOwnWindow {
+      // oona: 视频由 mpv 自建窗口（托管为下层子窗口）呈现，此视图保持透明。
+      wantsLayer = true
+      layer?.backgroundColor = NSColor.clear.cgColor
+    } else {
+      layer = videoLayer
+      videoLayer.colorspace = VideoView.SRGB
+      videoLayer.contentsScale = NSScreen.main!.backingScaleFactor
+      wantsLayer = true
+    }
 
     // other settings
     autoresizingMask = [.width, .height]

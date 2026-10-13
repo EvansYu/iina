@@ -89,6 +89,15 @@ class MPVController: NSObject {
     static let screenshot: UInt64 = 1000000
   }
 
+  /// oona: 使用 `vo=gpu-next` 自建窗口模式渲染。
+  ///
+  /// 杜比视界的 RPU reshaping 只存在于 libplacebo 渲染管线（`vo=gpu-next`）中，
+  /// 而 IINA 传统的 libmpv render API（`vo=libmpv`）走的是旧渲染器，无法正确显示
+  /// DV Profile 5（画面泛绿）。此模式下 mpv 会自建一个视频窗口，由
+  /// `PlayerWindowController.hostMPVVideoWindowIfNeeded()` 接管为播放器窗口的
+  /// 下层子窗口，并把 IINA 的视频区域设为透明以透出画面。
+  static let useGPUNextOwnWindow = true
+
   // The mpv_handle
   var mpv: OpaquePointer!
   var mpvRenderContext: OpaquePointer?
@@ -639,7 +648,17 @@ class MPVController: NSObject {
       mpv_observe_property(mpv, 0, k, v)
     }
 
-    // Initialize an uninitialized mpv instance. If the mpv instance is already running, an error is returned.
+    // oona: gpu-next 相关选项必须在 initialize 之前设置。vo=gpu-next 的自建窗口
+    // 需要 MoltenVK 初始化 Metal 表面，必须发生在主线程可用的场合：因此这里
+    // 不设置 force-window（它会让 vo 在主线程执行 initialize 时立即创建并死锁），
+    // 让 vo 在播放开始时由 mpv 核心线程创建，再由 PlayerWindowController 托管。
+    if Self.useGPUNextOwnWindow {
+      chkErr(setOptionString(MPVOption.Video.vo, "gpu-next", level: .verbose))
+      chkErr(setOptionString(MPVOption.Window.border, "no", level: .verbose))
+      chkErr(setOptionString("input-cursor", "no", level: .verbose))
+      chkErr(setOptionString("input-vo-keyboard", "no", level: .verbose))
+      chkErr(setOptionString("target-colorspace-hint", "yes", level: .verbose))
+    }
     chkErr(mpv_initialize(mpv))
 
     // The option watch-later-options is not available until after the mpv instance is initialized.
@@ -656,9 +675,12 @@ class MPVController: NSObject {
 
     // Set options that can be override by user's config. mpv will log user config when initialize,
     // so we put them here.
-    chkErr(setOptionString(MPVOption.Video.vo, "libmpv", level: .verbose))
+    // oona: gpu-next 模式的选项已在 initialize 前设置（见上），此处不再触发 vo 创建。
+    if !Self.useGPUNextOwnWindow {
+      chkErr(setOptionString(MPVOption.Video.vo, "libmpv", level: .verbose))
+      chkErr(setOptionString(MPVOption.Video.gpuHwdecInterop, "auto", level: .verbose))
+    }
     chkErr(setOptionString(MPVOption.Window.keepaspect, "yes", level: .verbose))
-    chkErr(setOptionString(MPVOption.Video.gpuHwdecInterop, "auto", level: .verbose))
   }
 
   /// Initialize the `mpv` renderer.
@@ -670,6 +692,11 @@ class MPVController: NSObject {
   func mpvInitRendering() {
     guard let mpv else {
       fatalError("mpvInitRendering() should be called after mpv handle being initialized!")
+    }
+    if Self.useGPUNextOwnWindow {
+      // oona: gpu-next 自建窗口模式下没有 render context；
+      // 视频窗口的托管见 PlayerWindowController.hostMPVVideoWindowIfNeeded()。
+      return
     }
     let apiType = UnsafeMutableRawPointer(mutating: (MPV_RENDER_API_TYPE_OPENGL as NSString).utf8String)
     var openGLInitParams = mpv_opengl_init_params(get_proc_address: mpvGetOpenGLFunc,
@@ -702,6 +729,8 @@ class MPVController: NSObject {
   /// - Reference: [OpenGL Context](https://www.khronos.org/opengl/wiki/OpenGL_Context)
   /// - Attention: Do not forget to unlock the OpenGL context by calling `unlockOpenGLContext`
   func lockAndSetOpenGLContext() {
+    // oona: gpu-next 自建窗口模式下没有 OpenGL 上下文，无需加锁。
+    guard let openGLContext else { return }
     CGLLockContext(openGLContext)
     CGLSetCurrentContext(openGLContext)
   }
@@ -712,6 +741,12 @@ class MPVController: NSObject {
   }
 
   func mpvUninitRendering() {
+    if Self.useGPUNextOwnWindow {
+      // oona: 无渲染上下文，直接销毁 mpv 句柄。
+      mpv_destroy(mpv)
+      mpv = nil
+      return
+    }
     guard let mpvRenderContext else { return }
     mpv_render_context_set_update_callback(mpvRenderContext, nil, nil)
     mpv_render_context_free(mpvRenderContext)

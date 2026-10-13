@@ -249,6 +249,10 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
 
     addObserver(to: .default, forName: .iinaFileLoaded, object: player) { [unowned self] _ in
       self.updateTitle()
+      // oona: 文件加载后视频窗口才会被 mpv 创建，此时（重新）启动托管扫描。
+      if self is MainWindowController {
+        self.hostMPVVideoWindowIfNeeded()
+      }
     }
 
     NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { [unowned self] _ in
@@ -584,6 +588,11 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
     AppDelegate.shared.menuController?.updatePluginMenu()
 
     NotificationCenter.default.post(name: .iinaMainWindowChanged, object: true)
+
+    // oona: 播放器主窗口激活时接管 mpv 视频子窗口（迷你播放器窗口不参与）。
+    if self is MainWindowController {
+      hostMPVVideoWindowIfNeeded()
+    }
   }
 
   /// The window changed its occlusion state.
@@ -605,6 +614,74 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
 
   func windowDidChangeScreen(_ notification: Notification) {
     videoView.updateDisplayLink()
+    syncMPVVideoWindowFrame()
+  }
+
+  // MARK: - oona: mpv gpu-next 自建窗口托管
+
+  /// mpv（vo=gpu-next 自建窗口模式）创建的视频窗口，被托管为本窗口的下层子窗口。
+  private var mpvVideoWindow: NSWindow?
+  private var mpvWindowSearchTimer: Timer?
+  private var mpvFrameChangeObserver: NSObjectProtocol?
+
+  /// 开始扫描并接管 mpv 自建的视频窗口（详见 `hostMPVVideoWindowScan`）。
+  /// - Note: mpv 在首个视频帧输出时才创建窗口，因此需要在播放开始后调用；
+  ///     内部以 0.5s 轮询直到接管成功或超时（30s）。
+  func hostMPVVideoWindowIfNeeded() {
+    guard MPVController.useGPUNextOwnWindow else { return }
+    if mpvWindowSearchTimer == nil {
+      videoView.postsFrameChangedNotifications = true
+      mpvFrameChangeObserver = NotificationCenter.default.addObserver(
+        forName: NSView.frameDidChangeNotification, object: videoView, queue: .main
+      ) { [weak self] _ in
+        self?.syncMPVVideoWindowFrame()
+      }
+      let timer = Timer(timeInterval: 0.5, target: self, selector: #selector(mpvWindowScanTimerFired),
+                        userInfo: nil, repeats: true)
+      RunLoop.main.add(timer, forMode: .common)
+      mpvWindowSearchTimer = timer
+    }
+    hostMPVVideoWindowScan()
+  }
+
+  @objc private func mpvWindowScanTimerFired() {
+    hostMPVVideoWindowScan()
+    if mpvVideoWindow != nil, let timer = mpvWindowSearchTimer {
+      timer.invalidate()
+      mpvWindowSearchTimer = nil
+    }
+  }
+
+  /// 识别 mpv 自建的窗口：contentView 的 layer 是 CAMetalLayer 的可见普通层级窗口。
+  private func hostMPVVideoWindowScan() {
+    guard mpvVideoWindow == nil, let playerWindow = window else { return }
+    guard let candidate = NSApp.windows.first(where: { w in
+      w != playerWindow && w.isVisible && w.level == .normal
+        && w.contentView?.layer is CAMetalLayer
+    }) else { return }
+    Logger.log("oona: 接管 mpv 视频窗口（\(candidate.frame.size)），挂为下层子窗口", subsystem: subsystem)
+    candidate.styleMask = .borderless
+    candidate.backgroundColor = .black
+    playerWindow.addChildWindow(candidate, ordered: .below)
+    mpvVideoWindow = candidate
+
+    // 视频区域透明化：让下层子窗口的画面透过主窗口的 videoView 区域显示。
+    playerWindow.isOpaque = false
+    playerWindow.backgroundColor = .clear
+    playerWindow.contentView?.wantsLayer = true
+    playerWindow.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
+
+    syncMPVVideoWindowFrame()
+  }
+
+  /// 将 mpv 视频子窗口对齐到 `videoView` 当前在屏幕上的矩形。
+  func syncMPVVideoWindowFrame() {
+    guard MPVController.useGPUNextOwnWindow, let mpvVideoWindow,
+          let playerWindow = window else { return }
+    let view = videoView
+    let rectInWindow = view.convert(view.bounds, to: nil)
+    let screenRect = playerWindow.convertToScreen(rectInWindow)
+    mpvVideoWindow.setFrame(screenRect, display: true)
   }
 
   // MARK: - UI

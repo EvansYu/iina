@@ -446,6 +446,9 @@ class MainWindowController: PlayerWindowController {
     super.windowDidLoad()
     MemoryUsage.shared.logUsage("after window loaded")
 
+    // oona: 开始扫描 mpv（vo=gpu-next）自建的视频窗口并托管为下层子窗口。
+    hostMPVVideoWindowIfNeeded()
+
     guard let window, let cv = window.contentView else { return }
 
     window.styleMask.insert(.fullSizeContentView)
@@ -1931,6 +1934,7 @@ class MainWindowController: PlayerWindowController {
 
   func windowDidResize(_ notification: Notification) {
     guard loaded, let window else { return }
+    syncMPVVideoWindowFrame()
     if !window.inLiveResize {
       liveText.requestAnalysis()
     }
@@ -2004,6 +2008,7 @@ class MainWindowController: PlayerWindowController {
   // MARK: - Window delegate: Activeness status
   func windowDidMove(_ notification: Notification) {
     guard loaded, let window else { return }
+    syncMPVVideoWindowFrame()
     player.events.emit(.windowMoved, data: window.frame)
   }
 

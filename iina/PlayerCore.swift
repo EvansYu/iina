@@ -576,12 +576,28 @@ class PlayerCore: NSObject {
 
     // Delay force-window until an actual file load to avoid Xcode-launched app startup hanging
     // while mpv tries to create a VO before IINA has entered its normal media-open path.
-    mpv.setString(MPVOption.Window.forceWindow, "yes", level: .verbose)
+    // oona: gpu-next 自建窗口模式下完全不设置 force-window——任何线程上的
+    // force-window 设置都会同步触发 vo 创建并持有 core 锁；播放尚未开始时这会与
+    // 主线程的 Metal 窗口初始化形成死锁。gpu-next 的窗口会在播放开始时由 mpv
+    // 核心线程自然创建（与独立 mpv 相同），再由 PlayerWindowController 托管。
+    if !MPVController.useGPUNextOwnWindow {
+      mpv.setString(MPVOption.Window.forceWindow, "yes", level: .verbose)
+    }
 
     // Send load file command
     info.justOpenedFile = true
     info.state = .loading
-    mpv.command(.loadfile, args: [path], level: .verbose)
+    if MPVController.useGPUNextOwnWindow {
+      // oona: gpu-next 自建窗口模式下，vo 创建需要主线程完成 Metal 窗口初始化。
+      // 若在主线程上同步发 loadfile，主线程会阻塞在 core 的 dispatch 锁上，
+      // 导致 vo 线程的窗口初始化永远无法完成（三方死锁）。改为后台线程发起。
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        guard let self, let mpv = self.mpv else { return }
+        mpv.command(.loadfile, args: [path], level: .verbose)
+      }
+    } else {
+      mpv.command(.loadfile, args: [path], level: .verbose)
+    }
 
     if Preference.bool(for: .autoRepeat) {
        let loopMode = Preference.DefaultRepeatMode(rawValue: Preference.integer(for: .defaultRepeatMode))
@@ -675,10 +691,14 @@ class PlayerCore: NSObject {
   func initVideo() {
     // init mpv render context.
     mpv.mpvInitRendering()
-    // `force-window=immediate` makes audio-only subtitle rendering work with `vo=libmpv`,
-    // but setting it before render initialization can race the VO thread against IINA's
-    // render context setup. Switch to `immediate` only after the render context exists.
-    mpv.setString(MPVOption.Window.forceWindow, "immediate", level: .verbose)
+    if !MPVController.useGPUNextOwnWindow {
+      // `force-window=immediate` makes audio-only subtitle rendering work with `vo=libmpv`,
+      // but setting it before render initialization can race the VO thread against IINA's
+      // render context setup. Switch to `immediate` only after the render context exists.
+      // oona: gpu-next 自建窗口模式下禁止在主线程设置此选项——它会立即在主线程上
+      // 创建 vo 并与主线程互相等待（死锁）。该选项已在 mpv 初始化前设置。
+      mpv.setString(MPVOption.Window.forceWindow, "immediate", level: .verbose)
+    }
     mainWindow.videoView.startDisplayLink()
     log("Initialized rendering")
     MemoryUsage.shared.logUsage("after rendering initialized")
