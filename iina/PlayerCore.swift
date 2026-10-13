@@ -588,10 +588,12 @@ class PlayerCore: NSObject {
     info.justOpenedFile = true
     info.state = .loading
     if MPVController.useGPUNextOwnWindow {
-      // oona: gpu-next 自建窗口模式下，vo 创建需要主线程完成 Metal 窗口初始化。
-      // 若在主线程上同步发 loadfile，主线程会阻塞在 core 的 dispatch 锁上，
-      // 导致 vo 线程的窗口初始化永远无法完成（三方死锁）。改为后台线程发起。
-      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      // oona: gpu-next 自建窗口模式下，loadfile 延迟到主队列执行：
+      // 1) 等 windowDidLoad 的同步初始化（sidebar 的 mpv 属性读取）全部完成；
+      // 2) vo 在播放开始时由核心线程创建，其 Metal 表面创建需要主线程，
+      //    此时主线程已回到运行循环可正常服务；在主线程上发 loadfile 本身
+      //    只是把文件入队随即返回，不会阻塞。
+      DispatchQueue.main.async { [weak self] in
         guard let self, let mpv = self.mpv else { return }
         mpv.command(.loadfile, args: [path], level: .verbose)
       }
@@ -699,7 +701,10 @@ class PlayerCore: NSObject {
       // 创建 vo 并与主线程互相等待（死锁）。该选项已在 mpv 初始化前设置。
       mpv.setString(MPVOption.Window.forceWindow, "immediate", level: .verbose)
     }
-    mainWindow.videoView.startDisplayLink()
+    // oona: gpu-next 自建窗口模式无 GL 渲染，display link 无用武之地。
+    if !MPVController.useGPUNextOwnWindow {
+      mainWindow.videoView.startDisplayLink()
+    }
     log("Initialized rendering")
     MemoryUsage.shared.logUsage("after rendering initialized")
   }

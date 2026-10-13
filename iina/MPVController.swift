@@ -98,6 +98,55 @@ class MPVController: NSObject {
   /// 下层子窗口，并把 IINA 的视频区域设为透明以透出画面。
   static let useGPUNextOwnWindow = true
 
+  // MARK: oona: vo 初始化门控
+
+  /// vo（gpu-next 自建窗口）是否正在初始化。
+  ///
+  /// vo 初始化期间，gpu-next 需要主线程创建 Metal 表面；此窗口期内主线程上的任何
+  /// 同步 mpv 访问都会形成环形死锁（vo 线程等主线程 ↔ 主线程等 core 锁）。
+  /// 因此 mpv 事件派发到主线程的回调（几乎都会读写 mpv）必须经 `dispatchToMain`
+  /// → `runWhenVideoReady` 延迟到 vo 就绪后执行。
+  /// - Note: 这些成员仅在主线程访问。
+  private(set) var voInitializing = false
+  private var pendingVideoReadyBlocks: [() -> Void] = []
+  private var voReadyFailSafeTimer: Timer?
+
+  /// 在主线程上执行 `block`；vo 初始化期间则推迟到 vo 就绪后执行。
+  func dispatchToMain(_ block: @escaping () -> Void) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { block(); return }
+      self.runWhenVideoReady(block)
+    }
+  }
+
+  /// 主线程调用。vo 未就绪时暂存 `block`，`markVideoReady()` 时按序冲刷。
+  func runWhenVideoReady(_ block: @escaping () -> Void) {
+    if !MPVController.useGPUNextOwnWindow || !voInitializing {
+      block()
+      return
+    }
+    pendingVideoReadyBlocks.append(block)
+  }
+
+  /// vo 就绪（mpv 视频窗口已创建并被接管）时由主线程调用：冲刷暂存的回调。
+  func markVideoReady() {
+    guard MPVController.useGPUNextOwnWindow, voInitializing else { return }
+    voInitializing = false
+    voReadyFailSafeTimer?.invalidate()
+    voReadyFailSafeTimer = nil
+    let blocks = pendingVideoReadyBlocks
+    pendingVideoReadyBlocks = []
+    log("oona: vo 就绪，冲刷 \(blocks.count) 个延迟的回调", level: .verbose)
+    blocks.forEach { DispatchQueue.main.async(execute: $0) }
+  }
+
+  private func scheduleVideoReadyFailSafe() {
+    // 兜底：纯音频等无视频窗口的场景，20s 后强制放行，避免 UI 永久延迟。
+    voReadyFailSafeTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
+      self?.markVideoReady()
+    }
+  }
+
   // The mpv_handle
   var mpv: OpaquePointer!
   var mpvRenderContext: OpaquePointer?
@@ -658,8 +707,19 @@ class MPVController: NSObject {
       chkErr(setOptionString("input-cursor", "no", level: .verbose))
       chkErr(setOptionString("input-vo-keyboard", "no", level: .verbose))
       chkErr(setOptionString("target-colorspace-hint", "yes", level: .verbose))
+      // oona: 字幕偏好（简中 → 繁中 → 英文；自动加载同名外挂字幕）。
+      // 直接 pre-init 设置以避开偏好系统缓存的竞态。
+      chkErr(setOptionString("slang", "zh,chi,zh-Hans,chs,sc,eng", level: .verbose))
+      chkErr(setOptionString("sub-auto", "fuzzy", level: .verbose))
     }
     chkErr(mpv_initialize(mpv))
+
+    if Self.useGPUNextOwnWindow {
+      // oona: 初始化完成后进入 vo 初始化门控期：主线程上的 mpv 事件回调延迟派发，
+      // 直到 PlayerWindowController 接管到 mpv 视频窗口（或 20s 兜底超时）。
+      voInitializing = true
+      scheduleVideoReadyFailSafe()
+    }
 
     // The option watch-later-options is not available until after the mpv instance is initialized.
     // Useful to log the value of this option as users often ask about what the Watch Later feature
@@ -737,6 +797,8 @@ class MPVController: NSObject {
 
   /// Unlock the OpenGL context associated with the mpv renderer.
   func unlockOpenGLContext() {
+    // oona: gpu-next 自建窗口模式下没有 OpenGL 上下文。
+    guard let openGLContext else { return }
     CGLUnlockContext(openGLContext)
   }
 
@@ -1132,7 +1194,7 @@ class MPVController: NSObject {
 
     switch eventId {
     case MPV_EVENT_SHUTDOWN:
-      DispatchQueue.main.async {
+      dispatchToMain {
         self.player.mpvHasShutdown()
       }
 
@@ -1169,11 +1231,11 @@ class MPVController: NSObject {
     case MPV_EVENT_AUDIO_RECONFIG: break
 
     case MPV_EVENT_VIDEO_RECONFIG:
-      DispatchQueue.main.async { self.player.onVideoReconfig() }
+      dispatchToMain { self.player.onVideoReconfig() }
 
     case MPV_EVENT_START_FILE:
       guard let path = getString(MPVProperty.path) else { break }
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.info.state = .starting
         player.fileStarted(path: path)
         let url = player.info.currentURL
@@ -1182,10 +1244,10 @@ class MPVController: NSObject {
       }
 
     case MPV_EVENT_FILE_LOADED:
-      DispatchQueue.main.async { self.player.fileLoaded() }
+      dispatchToMain { self.player.fileLoaded() }
 
     case MPV_EVENT_SEEK:
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.info.isSeeking = true
         // When playback is paused the display link may be shutdown in order to not waste energy.
         // It must be running when seeking to avoid slowdowns caused by mpv waiting for IINA to call
@@ -1202,7 +1264,7 @@ class MPVController: NSObject {
       }
 
     case MPV_EVENT_PLAYBACK_RESTART:
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.info.isSeeking = false
         // When playback is paused the display link may be shutdown in order to not waste energy.
         // The display link will be restarted while seeking. If playback is paused shut it down
@@ -1236,7 +1298,7 @@ class MPVController: NSObject {
         // condition, playback must be paused as soon as possible, so logging is done afterward.
         log("Pausing playback because \"pause when media is opened\" is enabled")
       }
-      DispatchQueue.main.async { self.player.fileEnded(dueToStopCommand) }
+      dispatchToMain { self.player.fileEnded(dueToStopCommand) }
 
     case MPV_EVENT_COMMAND_REPLY:
       let reply = event.pointee.reply_userdata
@@ -1248,12 +1310,12 @@ class MPVController: NSObject {
           // Unfortunately the mpv API does not provide any details on the failure. The error
           // code returned maps to "error running command", so all the alert can report is
           // that we cannot take a screenshot.
-          DispatchQueue.main.async {
+          dispatchToMain {
             Utility.showAlert("screenshot.error_taking")
           }
           break
         }
-        DispatchQueue.main.async { self.player.screenshotCallback() }
+        dispatchToMain { self.player.screenshotCallback() }
       }
 
     case MPV_EVENT_QUEUE_OVERFLOW:
@@ -1276,7 +1338,7 @@ class MPVController: NSObject {
     // This code is running in the com.colliderli.iina.controller dispatch queue. We must not run
     // plugins from a task in this queue. Accessing EventController data from a thread in this queue
     // results in data races that can cause a crash. See issue 3986.
-    DispatchQueue.main.async { [self] in
+    dispatchToMain { [self] in
       let eventName = "mpv.\(String(cString: mpv_event_name(eventId)))"
       player.events.emit(.init(eventName))
     }
@@ -1289,55 +1351,55 @@ class MPVController: NSObject {
     switch name {
 
     case MPVProperty.audioDeviceList:
-      DispatchQueue.main.async { self.player.audioDeviceListChanged() }
+      dispatchToMain { self.player.audioDeviceListChanged() }
 
     case MPVProperty.videoParams:
-      DispatchQueue.main.async { self.player.postNotification(.iinaVideoParamsChanged) }
+      dispatchToMain { self.player.postNotification(.iinaVideoParamsChanged) }
 
     case MPVProperty.videoParamsRotate:
       guard let rotation = UnsafePointer<Int>(OpaquePointer(property.data))?.pointee else {
         logPropertyValueError(MPVProperty.videoParamsRotate, property.format)
         break
       }
-      DispatchQueue.main.async { self.player.mainWindow.rotation = rotation }
+      dispatchToMain { self.player.mainWindow.rotation = rotation }
 
     case MPVProperty.videoParamsPrimaries:
       fallthrough;
 
     case MPVProperty.videoParamsGamma:
-      DispatchQueue.main.async { self.player.refreshEdrMode() }
+      dispatchToMain { self.player.refreshEdrMode() }
 
     case MPVOption.TrackSelection.vid:
-      DispatchQueue.main.async { self.player.vidChanged() }
+      dispatchToMain { self.player.vidChanged() }
 
     case MPVOption.TrackSelection.aid:
-      DispatchQueue.main.async { self.player.aidChanged() }
+      dispatchToMain { self.player.aidChanged() }
 
     case MPVOption.TrackSelection.sid:
-      DispatchQueue.main.async { self.player.sidChanged() }
+      dispatchToMain { self.player.sidChanged() }
 
     case MPVOption.Subtitles.secondarySid:
-      DispatchQueue.main.async { self.player.secondarySidChanged() }
+      dispatchToMain { self.player.secondarySidChanged() }
 
     case MPVOption.PlaybackControl.pause:
       guard let paused = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee else {
         logPropertyValueError(MPVOption.PlaybackControl.pause, property.format)
         break
       }
-      DispatchQueue.main.async { self.player.pauseChanged(paused) }
+      dispatchToMain { self.player.pauseChanged(paused) }
 
     case MPVProperty.chapter:
-      DispatchQueue.main.async { self.player.chapterChanged() }
+      dispatchToMain { self.player.chapterChanged() }
 
     case MPVOption.PlaybackControl.speed:
       guard let speed = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee else {
         logPropertyValueError(MPVOption.PlaybackControl.speed, property.format)
         break
       }
-      DispatchQueue.main.async { self.player.speedChanged(speed) }
+      dispatchToMain { self.player.speedChanged(speed) }
 
     case MPVOption.PlaybackControl.loopPlaylist, MPVOption.PlaybackControl.loopFile:
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         let loopMode = player.getLoopMode()
         switch loopMode {
         case .file:
@@ -1355,7 +1417,7 @@ class MPVController: NSObject {
         logPropertyValueError(MPVOption.Video.deinterlace, property.format)
         break
       }
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         // this property will fire a change event at file start
         if player.info.deinterlace != data {
           player.info.deinterlace = data
@@ -1366,7 +1428,7 @@ class MPVController: NSObject {
 
     case MPVOption.Video.hwdec:
       let data = String(cString: property.data.assumingMemoryBound(to: UnsafePointer<UInt8>.self).pointee)
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         if player.info.hwdec != data {
           player.info.hwdec = data
           player.sendOSD(.hwdec(player.info.hwdecEnabled))
@@ -1380,14 +1442,14 @@ class MPVController: NSObject {
         break
       }
       let intData = Int(data)
-      DispatchQueue.main.async { self.player.info.rotation = intData }
+      dispatchToMain { self.player.info.rotation = intData }
 
     case MPVOption.Audio.mute:
       guard let data = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee else {
         logPropertyValueError(MPVOption.Audio.mute, property.format)
         break
       }
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.info.isMuted = data
         player.syncUI(.volume)
         player.sendOSD(data ? OSDMessage.mute : OSDMessage.unMute)
@@ -1398,7 +1460,7 @@ class MPVController: NSObject {
         logPropertyValueError(MPVOption.Audio.volume, property.format)
         break
       }
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.info.volume = data
         player.syncUI(.volume)
         player.sendOSD(.volume(data))
@@ -1409,7 +1471,7 @@ class MPVController: NSObject {
         logPropertyValueError(MPVOption.Audio.audioDelay, property.format)
         break
       }
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.info.audioDelay = data
         player.sendOSD(.audioDelay(data))
         player.postNotification(.iinaAudioDelayChanged)
@@ -1417,14 +1479,14 @@ class MPVController: NSObject {
 
     case MPVOption.Subtitles.subVisibility:
       if let visible = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee {
-        DispatchQueue.main.async {
+        dispatchToMain {
           self.player.subVisibilityChanged(visible)
         }
       }
 
     case MPVOption.Subtitles.secondarySubVisibility:
       if let visible = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee {
-        DispatchQueue.main.async {
+        dispatchToMain {
           self.player.secondSubVisibilityChanged(visible)
         }
       }
@@ -1437,17 +1499,17 @@ class MPVController: NSObject {
         break
       }
       guard name == MPVOption.Subtitles.subDelay else {
-        DispatchQueue.main.async { self.player.secondarySubDelayChanged(data) }
+        dispatchToMain { self.player.secondarySubDelayChanged(data) }
         break
       }
-      DispatchQueue.main.async { self.player.subDelayChanged(data) }
+      dispatchToMain { self.player.subDelayChanged(data) }
 
     case MPVOption.Subtitles.subScale:
       guard let data = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee else {
         logPropertyValueError(MPVOption.Subtitles.subScale, property.format)
         break
       }
-      DispatchQueue.main.async { self.player.subScaleChanged(data) }
+      dispatchToMain { self.player.subScaleChanged(data) }
 
     case MPVOption.Subtitles.secondarySubPos:
       fallthrough
@@ -1457,9 +1519,9 @@ class MPVController: NSObject {
         break
       }
       if name == MPVOption.Subtitles.subPos {
-        DispatchQueue.main.async { self.player.subPosChanged(data) }
+        dispatchToMain { self.player.subPosChanged(data) }
       } else {
-        DispatchQueue.main.async { self.player.secondarySubPosChanged(data) }
+        dispatchToMain { self.player.secondarySubPosChanged(data) }
       }
 
     case MPVOption.Equalizer.contrast:
@@ -1468,7 +1530,7 @@ class MPVController: NSObject {
         break
       }
       let intData = Int(data)
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.info.contrast = intData
         player.sendOSD(.contrast(intData))
         player.postNotification(.iinaVideoEqualizerChanged)
@@ -1480,7 +1542,7 @@ class MPVController: NSObject {
         break
       }
       let intData = Int(data)
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.info.hue = intData
         player.sendOSD(.hue(intData))
         player.postNotification(.iinaVideoEqualizerChanged)
@@ -1492,7 +1554,7 @@ class MPVController: NSObject {
         break
       }
       let intData = Int(data)
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.info.brightness = intData
         player.sendOSD(.brightness(intData))
         player.postNotification(.iinaVideoEqualizerChanged)
@@ -1504,7 +1566,7 @@ class MPVController: NSObject {
         break
       }
       let intData = Int(data)
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.info.gamma = intData
         player.sendOSD(.gamma(intData))
         player.postNotification(.iinaVideoEqualizerChanged)
@@ -1516,7 +1578,7 @@ class MPVController: NSObject {
         break
       }
       let intData = Int(data)
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.info.saturation = intData
         player.sendOSD(.saturation(intData))
         player.postNotification(.iinaVideoEqualizerChanged)
@@ -1525,30 +1587,30 @@ class MPVController: NSObject {
     // following properties may change before file loaded
 
     case MPVProperty.playlistCount:
-      DispatchQueue.main.async { self.player.postNotification(.iinaPlaylistChanged) }
+      dispatchToMain { self.player.postNotification(.iinaPlaylistChanged) }
 
     case MPVProperty.trackList:
-      DispatchQueue.main.async { self.player.trackListChanged() }
+      dispatchToMain { self.player.trackListChanged() }
 
     case MPVProperty.vf:
-      DispatchQueue.main.async { [self] in
+      dispatchToMain { [self] in
         player.vfChanged()
       }
 
     case MPVProperty.af:
-      DispatchQueue.main.async { self.player.afChanged() }
+      dispatchToMain { self.player.afChanged() }
 
     case MPVOption.Window.fullscreen:
-      DispatchQueue.main.async { self.player.fullscreenChanged() }
+      dispatchToMain { self.player.fullscreenChanged() }
 
     case MPVOption.Window.ontop:
-      DispatchQueue.main.async { self.player.ontopChanged() }
+      dispatchToMain { self.player.ontopChanged() }
 
     case MPVOption.Window.windowScale:
-      DispatchQueue.main.async { self.player.windowScaleChanged() }
+      dispatchToMain { self.player.windowScaleChanged() }
 
     case MPVProperty.mediaTitle:
-      DispatchQueue.main.async { self.player.mediaTitleChanged() }
+      dispatchToMain { self.player.mediaTitleChanged() }
 
     case MPVProperty.idleActive:
       guard let idleActive = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee else {
@@ -1556,10 +1618,10 @@ class MPVController: NSObject {
         break
       }
       guard idleActive else { break }
-      DispatchQueue.main.async { self.player.idleActiveChanged() }
+      dispatchToMain { self.player.idleActiveChanged() }
 
     case MPVProperty.currentAo:
-      DispatchQueue.main.async { self.player.currentAoChanged() }
+      dispatchToMain { self.player.currentAoChanged() }
 
     default:
       // Utility.log("MPV property changed (unhandled): \(name)")
@@ -1569,7 +1631,7 @@ class MPVController: NSObject {
     // This code is running in the com.colliderli.iina.controller dispatch queue. We must not run
     // plugins from a task in this queue. Accessing EventController data from a thread in this queue
     // results in data races that can cause a crash. See issue 3986.
-    DispatchQueue.main.async { [self] in
+    dispatchToMain { [self] in
       let eventName = EventController.Name("mpv.\(name).changed")
       if player.events.hasListener(for: eventName) {
         // FIXME: better convert to JSValue before passing to call()

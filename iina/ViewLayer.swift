@@ -263,6 +263,9 @@ class ViewLayer: CAOpenGLLayer {
   ///     something other than the main thread, IINA will crash with a SIGABRT reporting "an implicit transaction wasn't created on a
   ///     main thread". See issue [#5038](https://github.com/iina/iina/issues/5038).
   override func display() {
+    // oona: gpu-next 自建窗口模式下，此 layer 未被挂载也不参与渲染；
+    // display link 等路径仍可能调用来这里，直接返回避免触碰未初始化的 GL 上下文。
+    if MPVController.useGPUNextOwnWindow { return }
 
     // May need to block other threads to allow the main thread to lock displayLock.
     mainThreadPriorityLock.beforeLocking()
@@ -313,6 +316,8 @@ class ViewLayer: CAOpenGLLayer {
   }
 
   func update(force: Bool = false) {
+    // oona: gpu-next 自建窗口模式下无渲染任务。
+    if MPVController.useGPUNextOwnWindow { return }
     mpvGLQueue.async { [self] in
       if force { forceDraw = true }
       needsFlip = true

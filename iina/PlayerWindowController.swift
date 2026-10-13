@@ -664,6 +664,8 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
     candidate.backgroundColor = .black
     playerWindow.addChildWindow(candidate, ordered: .below)
     mpvVideoWindow = candidate
+    // oona: 窗口已创建并接管 = vo 初始化完成，放行主线程上延迟的 mpv 回调。
+    player.mpv.markVideoReady()
 
     // 视频区域透明化：让下层子窗口的画面透过主窗口的 videoView 区域显示。
     playerWindow.isOpaque = false
