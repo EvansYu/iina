@@ -1498,6 +1498,8 @@ class MainWindowController: PlayerWindowController {
   ///     [willEnterFullScreenNotification](https://developer.apple.com/documentation/appkit/nswindow/willenterfullscreennotification).
   func windowWillEnterFullScreen(_ notification: Notification) {
     log("Entering full screen mode")
+    // oona: 全屏动画期间淡出 mpv 子窗口，避免跨步感。
+    mpvChildWindowWillTransition()
     // When playback is paused the display link is stopped in order to avoid wasting energy on
     // needless processing. It must be running while transitioning to full screen mode.
     videoView.displayActive()
@@ -1534,6 +1536,8 @@ class MainWindowController: PlayerWindowController {
   ///     [didEnterFullScreenNotification](https://developer.apple.com/documentation/appkit/nswindow/didenterfullscreennotification).
   func windowDidEnterFullScreen(_ notification: Notification) {
     log("Entered full screen mode")
+    // oona: 全屏落位——mpv 子窗口精确对齐后淡入。
+    mpvChildWindowDidTransition()
     fsState.finishAnimating()
 
     titleTextField?.alphaValue = 1
@@ -1630,6 +1634,8 @@ class MainWindowController: PlayerWindowController {
   ///     [willExitFullScreenNotification](https://developer.apple.com/documentation/appkit/nswindow/willexitfullscreennotification).
   func windowWillExitFullScreen(_ notification: Notification) {
     log("Exiting full screen mode")
+    // oona: 退出全屏动画期间淡出 mpv 子窗口。
+    mpvChildWindowWillTransition()
     // When playback is paused the display link is stopped in order to avoid wasting energy on
     // needless processing. It must be running while transitioning from full screen mode.
     videoView.displayActive()
@@ -1666,6 +1672,8 @@ class MainWindowController: PlayerWindowController {
   ///     [didExitFullScreenNotification](https://developer.apple.com/documentation/appkit/nswindow/didexitfullscreennotification).
   func windowDidExitFullScreen(_ notification: Notification) {
     log("Exited full screen mode")
+    // oona: 退出全屏落位——mpv 子窗口精确对齐后淡入。
+    mpvChildWindowDidTransition()
 
     if fsState.isFullscreen {
       // IINA should not be in full screen mode at this point. The fsState should indicate IINA is

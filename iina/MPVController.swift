@@ -707,6 +707,10 @@ class MPVController: NSObject {
       chkErr(setOptionString("input-cursor", "no", level: .verbose))
       chkErr(setOptionString("input-vo-keyboard", "no", level: .verbose))
       chkErr(setOptionString("target-colorspace-hint", "yes", level: .verbose))
+      // oona: 视频窗口由 PlayerWindowController 同步到 videoView 矩形；禁用 mpv 的
+      // 窗口宽高比约束（keepaspect-window），否则 setFrame 会被 AppKit 按视频
+      // 宽高比弹回，导致画面与播放器窗口错位（视频区内的信箱由 keepaspect 处理）。
+      chkErr(setOptionString("keepaspect-window", "no", level: .verbose))
       // oona: 字幕偏好（简中 → 繁中 → 英文；自动加载同名外挂字幕）。
       // 直接 pre-init 设置以避开偏好系统缓存的竞态。
       chkErr(setOptionString("slang", "zh,chi,zh-Hans,chs,sc,eng", level: .verbose))

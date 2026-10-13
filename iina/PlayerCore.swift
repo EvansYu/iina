@@ -588,20 +588,21 @@ class PlayerCore: NSObject {
     info.justOpenedFile = true
     info.state = .loading
     if MPVController.useGPUNextOwnWindow {
-      // oona: gpu-next 自建窗口模式下，loadfile 延迟到主队列执行：
-      // 1) 等 windowDidLoad 的同步初始化（sidebar 的 mpv 属性读取）全部完成；
-      // 2) vo 在播放开始时由核心线程创建，其 Metal 表面创建需要主线程，
-      //    此时主线程已回到运行循环可正常服务；在主线程上发 loadfile 本身
-      //    只是把文件入队随即返回，不会阻塞。
+      // oona: gpu-next 自建窗口模式下的加载序列：
+      // 1) loadfile 走主队列——openMainWindow 内 windowDidLoad（含 sidebar 的
+      //    同步 mpv 属性读取）先于该 block 执行完毕；若在后台立即执行，vo 创建
+      //    会与 windowDidLoad 尚未完成的属性读取死锁（vo 线程等主线程 ↔
+      //    主线程等 core 锁）。
+      // 2) loadfile 在主线程上只是入队即返回，不会阻塞主线程；播放开始后 vo
+      //    由核心线程创建，Metal 表面创建需要主线程运行循环（届时已空闲）。
+      // 3) watch-later 恢复的暂停状态会让 mpv 不渲染首帧 → vo 不创建 → 托管
+      //    落空，故播放启动后 1.5s 取消暂停（尊重"打开时暂停"偏好）。此调用
+      //    可能落在 vo 初始化持锁窗口内，必须放后台线程等锁（主线程保持空闲）。
       DispatchQueue.main.async { [weak self] in
         guard let self, let mpv = self.mpv else { return }
         mpv.command(.loadfile, args: [path], level: .verbose)
-        // oona: watch-later 会把上次退出时的暂停状态应用到新会话；若不取消暂停，
-        // mpv 不渲染首帧 → vo 迟迟不创建 → 托管扫描落空、20s 兜底后主线程失去
-        // 门控保护，vo 迟到初始化时会再次死锁。这里强制开始播放（尊重
-        // "打开时暂停"的用户偏好）。
         if !Preference.bool(for: .pauseWhenOpen) {
-          DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+          DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self, let mpv = self.mpv else { return }
             mpv.setFlag(MPVOption.PlaybackControl.pause, false, level: .verbose)
           }

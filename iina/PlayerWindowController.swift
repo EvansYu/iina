@@ -282,7 +282,11 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
     guard let window, let theme else { return }
 
     window.appearance = NSAppearance(iinaTheme: theme)
-    window.backgroundColor = window.effectiveAppearance.isDark ? .black : .white
+    // oona: gpu-next 自建窗口模式下主窗口须保持透明背景（视频透过透明区显示），
+    // 不能按明暗主题重设为黑/白，否则会遮住下层的 mpv 视频子窗口。
+    if !MPVController.useGPUNextOwnWindow {
+      window.backgroundColor = window.effectiveAppearance.isDark ? .black : .white
+    }
   }
 
   // MARK: - Mouse / Trackpad events
@@ -643,8 +647,8 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
       mpvFrameChangeObserver = NotificationCenter.default.addObserver(
         forName: NSView.frameDidChangeNotification, object: videoView, queue: .main
       ) { [weak self] _ in
-        // oona: 视图重挂载方案下同步 Metal drawable 尺寸（窗口几何由视图层级自动处理）。
-        self?.syncDrawableSize()
+        // oona: 视频区域几何变化时，同步 mpv 子窗口的位置尺寸并巩固透明状态。
+        self?.syncMPVVideoWindowFrame()
       }
       let timer = Timer(timeInterval: 0.5, target: self, selector: #selector(mpvWindowScanTimerFired),
                         userInfo: nil, repeats: true)
@@ -662,12 +666,12 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
     }
   }
 
-  /// 识别 mpv 自建的窗口（contentView 层级中含 CAMetalLayer），把它的
-  /// contentView（承载 Vulkan/Metal 表面的视图）重新挂载到 IINA 的 videoView 里。
+  /// 识别 mpv 自建的窗口，托管为播放器窗口的下层子窗口。
   ///
-  /// 视图重挂载（reparent）而不是子窗口+主窗口透明化：后者依赖 AppKit 窗口服务
-  /// 器的透明合成（实测被主题/背景色设置等干扰，导致黑屏），而视图作为
-  /// videoView 的子视图直接参与绘制，OSD/OSC 等兄弟视图天然覆盖其上。
+  /// mpv 的窗口（含其渲染视图/Metal 层/交换链）保持原样不动——搬动它的视图会
+  /// 断开 MoltenVK 的呈现链路（实测黑屏）。改为：把 mpv 窗口改为无边框并挂为
+  /// 播放器窗口的下层子窗口，播放器窗口在视频区域保持透明，视频透过透明区显示；
+  /// 子窗口几何跟随 videoView 同步。
   private func hostMPVVideoWindowScan() {
     guard mpvVideoWindow == nil, let playerWindow = window else { return }
     if knownWindowsAtScanStart.isEmpty {
@@ -698,47 +702,59 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
       }
       return
     }
-    Logger.log("oona: 找到 mpv 视频窗口，重挂载其 contentView 到 videoView", subsystem: subsystem)
+    Logger.log("oona: 找到 mpv 视频窗口（\(candidate.frame)），挂为下层子窗口", subsystem: subsystem)
     mpvVideoWindow = candidate
-    // mpv 可能随时销毁该窗口；防止窗口关闭时连带释放已被我们接管的视图。
+    // mpv 可能随时销毁该窗口；防止窗口关闭时连带释放。
     candidate.isReleasedWhenClosed = false
-    if let mpvView = candidate.contentView {
-      // 用占位视图替换，解除窗口对 mpvView 的持有，然后藏起空窗口。
-      candidate.contentView = NSView(frame: .zero)
-      candidate.orderOut(nil)
-      // mpv 的视图实现自己的鼠标/键盘响应（会吞掉事件），包一层 hitTest 透传容器，
-      // 让 videoView 继续拿到全部交互（点击暂停、双击全屏、拖拽等）。
-      let eater = MPVEventEaterView(frame: videoView.bounds)
-      eater.autoresizingMask = [.width, .height]
-      videoView.addSubview(eater)
-      eater.addSubview(mpvView)
-      mpvView.frame = eater.bounds
-      mpvView.autoresizingMask = [.width, .height]
-      mpvVideoView = mpvView
-      syncDrawableSize()
-    }
+    candidate.styleMask = .borderless
+    candidate.backgroundColor = .black
+    playerWindow.addChildWindow(candidate, ordered: .below)
+    // 视频区域透明化：让下层子窗口的画面透过主窗口显示。
+    enforceVideoAreaTransparency()
+    syncMPVVideoWindowFrame()
     // oona: 窗口已创建并接管 = vo 初始化完成，放行主线程上延迟的 mpv 回调。
     player.mpv.markVideoReady()
   }
 
-  /// 同步 mpv 视图层（CAMetalLayer）的 drawableSize 到当前视图尺寸。
-  func syncDrawableSize() {
-    guard let mpvView = mpvVideoView else { return }
-    // CAMetalLayer 可能是视图自身的 layer，也可能是其子 layer。
-    var metalLayer = mpvView.layer as? CAMetalLayer
-    if metalLayer == nil, let subs = mpvView.layer?.sublayers {
-      metalLayer = subs.first(where: { $0 is CAMetalLayer }) as? CAMetalLayer
+  /// 主窗口视频区域透明化（幂等；setMaterial 等路径可能重设背景色，需反复强调）。
+  func enforceVideoAreaTransparency() {
+    guard MPVController.useGPUNextOwnWindow, let playerWindow = window else { return }
+    playerWindow.isOpaque = false
+    playerWindow.backgroundColor = .clear
+  }
+
+  /// 将 mpv 视频子窗口对齐到 `videoView` 当前在屏幕上的矩形。
+  func syncMPVVideoWindowFrame() {
+    guard MPVController.useGPUNextOwnWindow, let mpvWin = mpvVideoWindow,
+          let playerWindow = window else { return }
+    let rectInWindow = videoView.convert(videoView.bounds, to: nil)
+    let screenRect = playerWindow.convertToScreen(rectInWindow)
+    if mpvWin.frame != screenRect {
+      mpvWin.setFrame(screenRect, display: true)
     }
-    guard let metalLayer else { return }
-    let scale = videoView.window?.backingScaleFactor ?? 2.0
-    let size = CGSize(width: videoView.bounds.width * scale, height: videoView.bounds.height * scale)
-    if metalLayer.drawableSize != size {
-      metalLayer.drawableSize = size
+    // 顺带巩固透明状态（防止主题切换等路径重设背景色）。
+    enforceVideoAreaTransparency()
+  }
+
+  /// oona: 全屏过渡开始——子窗口不参与系统全屏动画，逐帧跟随会有跨步感；
+  /// 过渡期间淡出，落位后再淡入。
+  func mpvChildWindowWillTransition() {
+    guard let mpvWin = mpvVideoWindow else { return }
+    NSAnimationContext.runAnimationGroup { ctx in
+      ctx.duration = 0.12
+      mpvWin.animator().alphaValue = 0
     }
   }
 
-  /// 兼容保留：视图重挂载方案不再需要同步子窗口几何。
-  func syncMPVVideoWindowFrame() {}
+  /// oona: 全屏过渡结束——先把子窗口精确落位到 videoView 矩形，再淡入。
+  func mpvChildWindowDidTransition() {
+    guard let mpvWin = mpvVideoWindow else { return }
+    syncMPVVideoWindowFrame()
+    NSAnimationContext.runAnimationGroup { ctx in
+      ctx.duration = 0.15
+      mpvWin.animator().alphaValue = 1
+    }
+  }
 
   // MARK: - UI
 
