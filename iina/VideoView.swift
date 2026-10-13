@@ -100,6 +100,12 @@ class VideoView: NSView {
       guard !isUninited else { return }
       isUninited = true
 
+      // oona: gpu-next 自建窗口模式下，先从视图层级移除重挂载进来的 mpv 视图，
+      // 再销毁 mpv（防止 mpv 销毁窗口时连带释放仍在本层级中的视图）。
+      if MPVController.useGPUNextOwnWindow && Thread.isMainThread {
+        subviews.forEach { $0.removeFromSuperview() }
+      }
+
       stopDisplayLink()
       player.mpv.mpvUninitRendering()
     }

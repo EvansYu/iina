@@ -619,10 +619,16 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
 
   // MARK: - oona: mpv gpu-next 自建窗口托管
 
-  /// mpv（vo=gpu-next 自建窗口模式）创建的视频窗口，被托管为本窗口的下层子窗口。
+  /// mpv（vo=gpu-next 自建窗口模式）创建的视频窗口。
   private var mpvVideoWindow: NSWindow?
+  /// 从 mpv 窗口取出并重挂载到 videoView 的视频视图。
+  private var mpvVideoView: NSView?
   private var mpvWindowSearchTimer: Timer?
   private var mpvFrameChangeObserver: NSObjectProtocol?
+  /// oona 诊断：扫描次数计数（用于周期性输出窗口清单）。
+  private var scanDumpCounter = 0
+  /// 托管启动时已知窗口的快照；mpv 的窗口 = 之后新出现的可见普通层级窗口。
+  private var knownWindowsAtScanStart: Set<ObjectIdentifier> = []
 
   /// 开始扫描并接管 mpv 自建的视频窗口（详见 `hostMPVVideoWindowScan`）。
   /// - Note: mpv 在首个视频帧输出时才创建窗口，因此需要在播放开始后调用；
@@ -630,11 +636,15 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
   func hostMPVVideoWindowIfNeeded() {
     guard MPVController.useGPUNextOwnWindow else { return }
     if mpvWindowSearchTimer == nil {
+      if knownWindowsAtScanStart.isEmpty {
+        knownWindowsAtScanStart = Set(NSApp.windows.map { ObjectIdentifier($0) })
+      }
       videoView.postsFrameChangedNotifications = true
       mpvFrameChangeObserver = NotificationCenter.default.addObserver(
         forName: NSView.frameDidChangeNotification, object: videoView, queue: .main
       ) { [weak self] _ in
-        self?.syncMPVVideoWindowFrame()
+        // oona: 视图重挂载方案下同步 Metal drawable 尺寸（窗口几何由视图层级自动处理）。
+        self?.syncDrawableSize()
       }
       let timer = Timer(timeInterval: 0.5, target: self, selector: #selector(mpvWindowScanTimerFired),
                         userInfo: nil, repeats: true)
@@ -652,39 +662,83 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
     }
   }
 
-  /// 识别 mpv 自建的窗口：contentView 的 layer 是 CAMetalLayer 的可见普通层级窗口。
+  /// 识别 mpv 自建的窗口（contentView 层级中含 CAMetalLayer），把它的
+  /// contentView（承载 Vulkan/Metal 表面的视图）重新挂载到 IINA 的 videoView 里。
+  ///
+  /// 视图重挂载（reparent）而不是子窗口+主窗口透明化：后者依赖 AppKit 窗口服务
+  /// 器的透明合成（实测被主题/背景色设置等干扰，导致黑屏），而视图作为
+  /// videoView 的子视图直接参与绘制，OSD/OSC 等兄弟视图天然覆盖其上。
   private func hostMPVVideoWindowScan() {
     guard mpvVideoWindow == nil, let playerWindow = window else { return }
+    if knownWindowsAtScanStart.isEmpty {
+      knownWindowsAtScanStart = Set(NSApp.windows.map { ObjectIdentifier($0) })
+    }
     guard let candidate = NSApp.windows.first(where: { w in
-      w != playerWindow && w.isVisible && w.level == .normal
-        && w.contentView?.layer is CAMetalLayer
-    }) else { return }
-    Logger.log("oona: 接管 mpv 视频窗口（\(candidate.frame.size)），挂为下层子窗口", subsystem: subsystem)
-    candidate.styleMask = .borderless
-    candidate.backgroundColor = .black
-    playerWindow.addChildWindow(candidate, ordered: .below)
+      guard w !== playerWindow, w.isVisible, w.level == .normal else { return false }
+      guard !knownWindowsAtScanStart.contains(ObjectIdentifier(w)) else { return false }
+      // 排除 IINA 自己的窗口类型（mpv 创建的是普通 NSWindow）。
+      guard !(w is MainWindow), !(w is MiniPlayerWindow), !(w is NSPanel) else { return false }
+      return true
+    }) else {
+      // oona 诊断：每 4 次扫描（约 2s）输出一次窗口清单，定位匹配失败原因。
+      scanDumpCounter += 1
+      if scanDumpCounter % 4 == 0 {
+        let summary = NSApp.windows.map { w -> String in
+          let cvDesc: String
+          if let cv = w.contentView {
+            let layerDesc = cv.layer.map { String(describing: type(of: $0)) } ?? "nil"
+            let subs = (cv.layer?.sublayers ?? []).map { String(describing: type(of: $0)) }.joined(separator: ",")
+            cvDesc = "\(String(describing: type(of: cv)))[\(layerDesc){\(subs)}]"
+          } else {
+            cvDesc = "nil"
+          }
+          return "\(String(describing: type(of: w)))|vis=\(w.isVisible)|lvl=\(w.level.rawValue)|cv=\(cvDesc)"
+        }.joined(separator: "\n    ")
+        Logger.log("oona: 窗口清单（\(NSApp.windows.count) 个）：\n    \(summary)", level: .debug, subsystem: subsystem)
+      }
+      return
+    }
+    Logger.log("oona: 找到 mpv 视频窗口，重挂载其 contentView 到 videoView", subsystem: subsystem)
     mpvVideoWindow = candidate
+    // mpv 可能随时销毁该窗口；防止窗口关闭时连带释放已被我们接管的视图。
+    candidate.isReleasedWhenClosed = false
+    if let mpvView = candidate.contentView {
+      // 用占位视图替换，解除窗口对 mpvView 的持有，然后藏起空窗口。
+      candidate.contentView = NSView(frame: .zero)
+      candidate.orderOut(nil)
+      // mpv 的视图实现自己的鼠标/键盘响应（会吞掉事件），包一层 hitTest 透传容器，
+      // 让 videoView 继续拿到全部交互（点击暂停、双击全屏、拖拽等）。
+      let eater = MPVEventEaterView(frame: videoView.bounds)
+      eater.autoresizingMask = [.width, .height]
+      videoView.addSubview(eater)
+      eater.addSubview(mpvView)
+      mpvView.frame = eater.bounds
+      mpvView.autoresizingMask = [.width, .height]
+      mpvVideoView = mpvView
+      syncDrawableSize()
+    }
     // oona: 窗口已创建并接管 = vo 初始化完成，放行主线程上延迟的 mpv 回调。
     player.mpv.markVideoReady()
-
-    // 视频区域透明化：让下层子窗口的画面透过主窗口的 videoView 区域显示。
-    playerWindow.isOpaque = false
-    playerWindow.backgroundColor = .clear
-    playerWindow.contentView?.wantsLayer = true
-    playerWindow.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
-
-    syncMPVVideoWindowFrame()
   }
 
-  /// 将 mpv 视频子窗口对齐到 `videoView` 当前在屏幕上的矩形。
-  func syncMPVVideoWindowFrame() {
-    guard MPVController.useGPUNextOwnWindow, let mpvVideoWindow,
-          let playerWindow = window else { return }
-    let view = videoView
-    let rectInWindow = view.convert(view.bounds, to: nil)
-    let screenRect = playerWindow.convertToScreen(rectInWindow)
-    mpvVideoWindow.setFrame(screenRect, display: true)
+  /// 同步 mpv 视图层（CAMetalLayer）的 drawableSize 到当前视图尺寸。
+  func syncDrawableSize() {
+    guard let mpvView = mpvVideoView else { return }
+    // CAMetalLayer 可能是视图自身的 layer，也可能是其子 layer。
+    var metalLayer = mpvView.layer as? CAMetalLayer
+    if metalLayer == nil, let subs = mpvView.layer?.sublayers {
+      metalLayer = subs.first(where: { $0 is CAMetalLayer }) as? CAMetalLayer
+    }
+    guard let metalLayer else { return }
+    let scale = videoView.window?.backingScaleFactor ?? 2.0
+    let size = CGSize(width: videoView.bounds.width * scale, height: videoView.bounds.height * scale)
+    if metalLayer.drawableSize != size {
+      metalLayer.drawableSize = size
+    }
   }
+
+  /// 兼容保留：视图重挂载方案不再需要同步子窗口几何。
+  func syncMPVVideoWindowFrame() {}
 
   // MARK: - UI
 
@@ -829,4 +883,14 @@ fileprivate func keyEventArgs(_ event: NSEvent) -> [[String: Any]] {
     "y": event.locationInWindow.y,
     "isRepeat": event.isARepeat
   ] as [String : Any]]
+}
+
+// MARK: - oona: mpv 视图事件透传容器
+
+/// 包住 mpv 的视频视图，把所有命中测试转给父视图（videoView），
+/// 避免 mpv 的响应链吞掉 IINA 的鼠标/键盘交互。
+final class MPVEventEaterView: NSView {
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    superview
+  }
 }

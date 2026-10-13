@@ -596,6 +596,16 @@ class PlayerCore: NSObject {
       DispatchQueue.main.async { [weak self] in
         guard let self, let mpv = self.mpv else { return }
         mpv.command(.loadfile, args: [path], level: .verbose)
+        // oona: watch-later 会把上次退出时的暂停状态应用到新会话；若不取消暂停，
+        // mpv 不渲染首帧 → vo 迟迟不创建 → 托管扫描落空、20s 兜底后主线程失去
+        // 门控保护，vo 迟到初始化时会再次死锁。这里强制开始播放（尊重
+        // "打开时暂停"的用户偏好）。
+        if !Preference.bool(for: .pauseWhenOpen) {
+          DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, let mpv = self.mpv else { return }
+            mpv.setFlag(MPVOption.PlaybackControl.pause, false, level: .verbose)
+          }
+        }
       }
     } else {
       mpv.command(.loadfile, args: [path], level: .verbose)
