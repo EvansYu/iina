@@ -113,7 +113,11 @@ class MPVController: NSObject {
 
   /// 在主线程上执行 `block`；vo 初始化期间则推迟到 vo 就绪后执行。
   func dispatchToMain(_ block: @escaping () -> Void) {
-    DispatchQueue.main.async { [weak self] in
+    // oona: 用 RunLoop 原生调度而非 DispatchQueue.main.async——GCD 主队列
+    // 串行不可重入；若本块成为主队列块，块内 performMPVCall 的泵送将无法排空
+    // 主队列，mpv 的 MacCommon.config(dispatch_sync 到主队列) 永远无法完成
+    // （死锁）。RunLoop 调度不占用主队列，泵送可正常服务 mpv 的派发。
+    RunLoop.main.perform { [weak self] in
       guard let self else { block(); return }
       self.runWhenVideoReady(block)
     }
@@ -137,7 +141,7 @@ class MPVController: NSObject {
     let blocks = pendingVideoReadyBlocks
     pendingVideoReadyBlocks = []
     log("oona: vo 就绪，冲刷 \(blocks.count) 个延迟的回调", level: .verbose)
-    blocks.forEach { DispatchQueue.main.async(execute: $0) }
+    blocks.forEach { RunLoop.main.perform($0) }
   }
 
   private func scheduleVideoReadyFailSafe() {
@@ -145,6 +149,44 @@ class MPVController: NSObject {
     voReadyFailSafeTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
       self?.markVideoReady()
     }
+  }
+
+  // MARK: oona: 主线程 mpv 调用防死锁包装
+
+  /// mpv 是否已完成 mpv_initialize（预初始化阶段的选项设置不经过泵送包装——
+  /// 此时泵送会让未完成启动的主队列块提前执行，破坏启动顺序）。
+  private var mpvInitialized = false
+
+  /// mpv C API 调用的工作队列（并发：嵌套的主线程调用可并行执行，避免自锁）。
+  private static let mpvCallQueue = DispatchQueue(label: "app.oona.mpv-call",
+                                                  qos: .userInitiated, attributes: .concurrent)
+
+  /// 在主线程上执行 mpv C 调用的防死锁包装。
+  ///
+  /// mpv 的 mac 窗口协调（创建/重配置）需要向主队列派发工作；若主线程阻塞在
+  /// mp_dispatch_lock 内等待 core，派发永远无法执行 → 环形死锁（5 个采样样本
+  /// 的共同根因）。此包装把 C 调用放到后台队列执行，主线程进入嵌套运行循环
+  /// **持续服务主队列派发**——等待期间 mpv 的窗口工作正常完成，锁随之释放。
+  /// 非主线程调用直通（阻塞后台线程无害）。
+  ///
+  /// - Note: 同步语义对调用方完全透明；嵌套运行循环与 AppKit 模态等待同类，
+  ///     期间其他主队列块（含 IINA 事件回调）可能重入执行——IINA 本身就是
+  ///     事件驱动的，可容忍。
+  func performMPVCall<T>(_ work: @escaping () -> T) -> T {
+    guard Thread.isMainThread, Self.useGPUNextOwnWindow, mpvInitialized else {
+      return work()
+    }
+    var result: T!
+    let done = DispatchSemaphore(value: 0)
+    Self.mpvCallQueue.async {
+      result = work()
+      done.signal()
+    }
+    while done.wait(timeout: .now()) == .timedOut {
+      // 每片 50ms：服务主队列派发（mpv 窗口操作）与 AppKit 事件。
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    return result
   }
 
   // The mpv_handle
@@ -720,6 +762,7 @@ class MPVController: NSObject {
       chkErr(setOptionString("title", "oona-mpv-\(player.playerNumber)", level: .verbose))
     }
     chkErr(mpv_initialize(mpv))
+    mpvInitialized = true
 
     if Self.useGPUNextOwnWindow {
       // oona: 初始化完成后进入 vo 初始化门控期：主线程上的 mpv 事件回调延迟派发，
@@ -819,6 +862,7 @@ class MPVController: NSObject {
   }
 
   func mpvUninitRendering() {
+    mpvInitialized = false
     if Self.useGPUNextOwnWindow {
       // oona: 无渲染上下文，直接销毁 mpv 句柄。
       mpv_destroy(mpv)
@@ -904,7 +948,7 @@ class MPVController: NSObject {
         }
       }
     }
-    let returnValue = mpv_command(self.mpv, &cargs)
+    let returnValue = performMPVCall { mpv_command(self.mpv, &cargs) }
     if checkError {
       chkErr(returnValue)
     } else if let cb = returnValueCallback {
@@ -914,7 +958,7 @@ class MPVController: NSObject {
 
   func command(rawString: String, level: Logger.Level = .debug) -> Int32 {
     log("Run command: \(rawString)", level: level)
-    return mpv_command_string(mpv, rawString)
+    return performMPVCall { mpv_command_string(self.mpv, rawString) }
   }
 
   func asyncCommand(_ command: MPVCommand, args: [String?] = [], checkError: Bool = true,
@@ -944,25 +988,25 @@ class MPVController: NSObject {
   func setFlag(_ name: String, _ flag: Bool, level: Logger.Level = .debug) {
     log("Set property: \(name)=\(flag)", level: level)
     var data: Int32 = flag ? 1 : 0
-    mpv_set_property(mpv, name, MPV_FORMAT_FLAG, &data)
+    performMPVCall { mpv_set_property(self.mpv, name, MPV_FORMAT_FLAG, &data) }
   }
 
   func setInt(_ name: String, _ value: Int, level: Logger.Level = .debug) {
     log("Set property: \(name)=\(value)", level: level)
     var data = Int64(value)
-    mpv_set_property(mpv, name, MPV_FORMAT_INT64, &data)
+    performMPVCall { mpv_set_property(self.mpv, name, MPV_FORMAT_INT64, &data) }
   }
 
   func setDouble(_ name: String, _ value: Double, level: Logger.Level = .debug) {
     log("Set property: \(name)=\(value)", level: level)
     var data = value
-    mpv_set_property(mpv, name, MPV_FORMAT_DOUBLE, &data)
+    performMPVCall { mpv_set_property(self.mpv, name, MPV_FORMAT_DOUBLE, &data) }
   }
 
   @discardableResult
   func setString(_ name: String, _ value: String, level: Logger.Level = .debug) -> Int32 {
     log("Set property: \(name)=\(value)", level: level)
-    return mpv_set_property_string(mpv, name, value)
+    return performMPVCall { mpv_set_property_string(self.mpv, name, value) }
   }
 
   @discardableResult
@@ -972,7 +1016,7 @@ class MPVController: NSObject {
       return MPV_ERROR_OPTION_NOT_FOUND.rawValue
     }
     log("Set property to default: \(name)=\(value)", level: level)
-    return mpv_set_property_string(mpv, name, value)
+    return performMPVCall { mpv_set_property_string(self.mpv, name, value) }
   }
 
   func getEnum<T: MPVOptionValue>(_ name: String) -> T {
@@ -984,24 +1028,24 @@ class MPVController: NSObject {
 
   func getInt(_ name: String) -> Int {
     var data = Int64()
-    mpv_get_property(mpv, name, MPV_FORMAT_INT64, &data)
+    performMPVCall { mpv_get_property(self.mpv, name, MPV_FORMAT_INT64, &data) }
     return Int(data)
   }
 
   func getDouble(_ name: String) -> Double {
     var data = Double()
-    mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &data)
+    performMPVCall { mpv_get_property(self.mpv, name, MPV_FORMAT_DOUBLE, &data) }
     return data
   }
 
   func getFlag(_ name: String) -> Bool {
     var data = Int32()
-    mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &data)
+    performMPVCall { mpv_get_property(self.mpv, name, MPV_FORMAT_FLAG, &data) }
     return data > 0
   }
 
   func getString(_ name: String) -> String? {
-    let cstr = mpv_get_property_string(mpv, name)
+    let cstr = performMPVCall { mpv_get_property_string(self.mpv, name) }
     let str: String? = cstr == nil ? nil : String(cString: cstr!)
     mpv_free(cstr)
     return str
@@ -1013,7 +1057,7 @@ class MPVController: NSObject {
 
     var result: [MPVFilter] = []
     var node = mpv_node()
-    mpv_get_property(mpv, name, MPV_FORMAT_NODE, &node)
+    performMPVCall { mpv_get_property(self.mpv, name, MPV_FORMAT_NODE, &node) }
     guard let filters = (try? MPVNode.parse(node)!) as? [[String: Any?]] else { return result }
     filters.forEach { f in
       let filter = MPVFilter(name: f["name"] as! String,
@@ -1062,7 +1106,7 @@ class MPVController: NSObject {
     // Get the current list of filters from mpv as a mpv_node tree.
     var oldNode = mpv_node()
     defer { mpv_free_node_contents(&oldNode) }
-    mpv_get_property(mpv, name, MPV_FORMAT_NODE, &oldNode)
+    performMPVCall { mpv_get_property(self.mpv, name, MPV_FORMAT_NODE, &oldNode) }
 
     let oldList = oldNode.u.list!.pointee
 
@@ -1118,7 +1162,7 @@ class MPVController: NSObject {
 
     // Set the list of filters using the new node that leaves out the filter to be removed.
     log("Set property: \(name)=<a mpv node>")
-    mpv_set_property(mpv, name, MPV_FORMAT_NODE, &newNode)
+    performMPVCall { mpv_set_property(self.mpv, name, MPV_FORMAT_NODE, &newNode) }
     return true
   }
 
@@ -1139,7 +1183,7 @@ class MPVController: NSObject {
 
   func getNode(_ name: String) -> Any? {
     var node = mpv_node()
-    mpv_get_property(mpv, name, MPV_FORMAT_NODE, &node)
+    performMPVCall { mpv_get_property(self.mpv, name, MPV_FORMAT_NODE, &node) }
     let parsed = try? MPVNode.parse(node)
     mpv_free_node_contents(&node)
     return parsed
@@ -1151,7 +1195,7 @@ class MPVController: NSObject {
       return
     }
     log("Set property: \(name)=<a mpv node>")
-    mpv_set_property(mpv, name, MPV_FORMAT_NODE, &node)
+    performMPVCall { mpv_set_property(self.mpv, name, MPV_FORMAT_NODE, &node) }
     MPVNode.free(node)
   }
 
@@ -1711,7 +1755,7 @@ class MPVController: NSObject {
     }()
     log("Set option: \(name)=\(value)", level: levelToUse)
     var data = Double(value)
-    return mpv_set_option(mpv, name, MPV_FORMAT_DOUBLE, &data)
+    return performMPVCall { mpv_set_option(self.mpv, name, MPV_FORMAT_DOUBLE, &data) }
   }
 
   private func setOptionInt(_ name: String, _ value: Int, level: Logger.Level = .debug,
@@ -1720,7 +1764,7 @@ class MPVController: NSObject {
       MPVOptionDefaults.shared.getInt(name) == value ? .verbose  : level
     log("Set option: \(name)=\(value)", level: levelToUse)
     var data = Int64(value)
-    return mpv_set_option(mpv, name, MPV_FORMAT_INT64, &data)
+    return performMPVCall { mpv_set_option(self.mpv, name, MPV_FORMAT_INT64, &data) }
   }
 
   @discardableResult
@@ -1729,7 +1773,7 @@ class MPVController: NSObject {
     let levelToUse: Logger.Level = verboseIfDefault &&
       MPVOptionDefaults.shared.getString(name) == value ? .verbose  : level
     log("Set option: \(name)=\(value)", level: levelToUse)
-    return mpv_set_option_string(mpv, name, value)
+    return performMPVCall { mpv_set_option_string(self.mpv, name, value) }
   }
 
   private func setOptionalOptionColor(_ name: String, _ value: String?,

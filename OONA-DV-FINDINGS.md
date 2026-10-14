@@ -60,3 +60,33 @@ IINA 在主线程同步调用 mpv API（数十个入口：标题/侧栏/NowPlayi
 ### 唯一根治路径
 把 IINA 的 mpv 访问层全面异步化（observe_property 缓存 + async 读），
 主线程永不等待 core 锁——即最初评估的"周级、多会话"重构。
+
+## 终局结论（第 7 个采样后）
+
+### 完整证据链
+mpv 日志：文件打开完成（1.087s）→ 播放从未开始（"Playing" 计数 = 0）→ 无任何错误。
+
+主线程 100% 采样路径：
+```
+RunLoop 块(sidChanged) → performMPVCall → 泵送 → 排空主队列
+→ 主队列块(fileStarted) → getMediaTitle → performMPVCall → 泵送
+→ 排空主队列 → 更多 mpv 调用块 → ... 无界级联
+```
+vo 线程卡点（第 6 采样）：`run_reconfig → MacCommon.config → DispatchQueue.main.sync`。
+
+### 机理定论
+mpv 的 Swift 层（MacCommon）在 vo 重配置期间，持有 core 派发锁的同时向
+主队列同步派发。嵌入方（IINA）的任何主线程 mpv 调用在此期间会：
+- 占用主队列 → mpv 的 dispatch_sync 永不完成（串行队列不可重入）；或
+- 经泵送排空主队列 → 级联更多 mpv 调用 → 活锁
+且 core 派发锁在特定并发序列下进入"所有内部线程空闲、外部调用永久阻塞"的
+卡死态（第 5/7 采样证实，先于嵌入方任何机制存在）。
+
+这是 libmpv + vo=gpu-next 自建窗口在 macOS 上的组合问题（上游几乎无人测试
+此路径：独立 mpv 二进制的主循环结构与嵌入完全不同）。**嵌入方无法根治，
+需要 mpv 上游修复（MacCommon.config 的同步派发改为异步/免锁）。**
+
+### 交付物
+- 本分支：完整的 4 代架构实现 + 死锁分类学（7 样本）
+- 用户可用方案：/Applications/mpv.app（DV 完美）+ IINA（日常）
+- 建议上游 issue：向 mpv 报告 libmpv+macvk+force-window 的 dispatch 卡死
