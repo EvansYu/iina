@@ -624,31 +624,31 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
   // MARK: - oona: mpv gpu-next 自建窗口托管
 
   /// mpv（vo=gpu-next 自建窗口模式）创建的视频窗口。
+  /// 启动期扫描到即隐藏存储；播放器窗口加载后挂为下层子窗口。
   private var mpvVideoWindow: NSWindow?
-  /// 从 mpv 窗口取出并重挂载到 videoView 的视频视图。
-  private var mpvVideoView: NSView?
   private var mpvWindowSearchTimer: Timer?
   private var mpvFrameChangeObserver: NSObjectProtocol?
   /// oona 诊断：扫描次数计数（用于周期性输出窗口清单）。
   private var scanDumpCounter = 0
-  /// 托管启动时已知窗口的快照；mpv 的窗口 = 之后新出现的可见普通层级窗口。
-  private var knownWindowsAtScanStart: Set<ObjectIdentifier> = []
 
-  /// 开始扫描并接管 mpv 自建的视频窗口（详见 `hostMPVVideoWindowScan`）。
-  /// - Note: mpv 在首个视频帧输出时才创建窗口，因此需要在播放开始后调用；
-  ///     内部以 0.5s 轮询直到接管成功或超时（30s）。
+  /// 开始扫描 mpv 自建的视频窗口。
+  /// - Note: 可在应用启动时调用（播放器窗口尚未加载）：扫描只按标题识别 mpv 窗口
+  ///   并隐藏存储；播放器窗口加载后（windowDidLoad 再次调用本方法）挂载为子窗口。
+  /// - Important: 窗口未加载期间不得触碰 `window` / `videoView`（会触发 nib 加载，
+  ///     其中的 mpv 访问可能与 vo 创建死锁）。
   func hostMPVVideoWindowIfNeeded() {
     guard MPVController.useGPUNextOwnWindow else { return }
     if mpvWindowSearchTimer == nil {
-      if knownWindowsAtScanStart.isEmpty {
-        knownWindowsAtScanStart = Set(NSApp.windows.map { ObjectIdentifier($0) })
-      }
-      videoView.postsFrameChangedNotifications = true
-      mpvFrameChangeObserver = NotificationCenter.default.addObserver(
-        forName: NSView.frameDidChangeNotification, object: videoView, queue: .main
-      ) { [weak self] _ in
-        // oona: 视频区域几何变化时，同步 mpv 子窗口的位置尺寸并巩固透明状态。
-        self?.syncMPVVideoWindowFrame()
+      if isWindowLoaded {
+        videoView.postsFrameChangedNotifications = true
+        if mpvFrameChangeObserver == nil {
+          mpvFrameChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification, object: videoView, queue: .main
+          ) { [weak self] _ in
+            // oona: 视频区域几何变化时，同步 mpv 子窗口的位置尺寸并巩固透明状态。
+            self?.syncMPVVideoWindowFrame()
+          }
+        }
       }
       let timer = Timer(timeInterval: 0.5, target: self, selector: #selector(mpvWindowScanTimerFired),
                         userInfo: nil, repeats: true)
@@ -656,64 +656,60 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
       mpvWindowSearchTimer = timer
     }
     hostMPVVideoWindowScan()
+    attachMPVVideoWindowIfPossible()
   }
 
   @objc private func mpvWindowScanTimerFired() {
     hostMPVVideoWindowScan()
+    attachMPVVideoWindowIfPossible()
     if mpvVideoWindow != nil, let timer = mpvWindowSearchTimer {
       timer.invalidate()
       mpvWindowSearchTimer = nil
     }
   }
 
-  /// 识别 mpv 自建的窗口，托管为播放器窗口的下层子窗口。
-  ///
-  /// mpv 的窗口（含其渲染视图/Metal 层/交换链）保持原样不动——搬动它的视图会
-  /// 断开 MoltenVK 的呈现链路（实测黑屏）。改为：把 mpv 窗口改为无边框并挂为
-  /// 播放器窗口的下层子窗口，播放器窗口在视频区域保持透明，视频透过透明区显示；
-  /// 子窗口几何跟随 videoView 同步。
+  /// 按窗口标题识别本播放器核心的 mpv 窗口（title 选项在 mpv 初始化前设为
+  /// "oona-mpv-<playerNumber>"）。找到即隐藏存储，并放行 vo 门控。
   private func hostMPVVideoWindowScan() {
-    guard mpvVideoWindow == nil, let playerWindow = window else { return }
-    if knownWindowsAtScanStart.isEmpty {
-      knownWindowsAtScanStart = Set(NSApp.windows.map { ObjectIdentifier($0) })
-    }
+    guard mpvVideoWindow == nil else { return }
+    let expectedTitle = "oona-mpv-\(player.playerNumber)"
     guard let candidate = NSApp.windows.first(where: { w in
-      guard w !== playerWindow, w.isVisible, w.level == .normal else { return false }
-      guard !knownWindowsAtScanStart.contains(ObjectIdentifier(w)) else { return false }
-      // 排除 IINA 自己的窗口类型（mpv 创建的是普通 NSWindow）。
-      guard !(w is MainWindow), !(w is MiniPlayerWindow), !(w is NSPanel) else { return false }
-      return true
+      w.title == expectedTitle && !(w is MainWindow) && !(w is MiniPlayerWindow)
     }) else {
       // oona 诊断：每 4 次扫描（约 2s）输出一次窗口清单，定位匹配失败原因。
       scanDumpCounter += 1
       if scanDumpCounter % 4 == 0 {
         let summary = NSApp.windows.map { w -> String in
-          let cvDesc: String
-          if let cv = w.contentView {
-            let layerDesc = cv.layer.map { String(describing: type(of: $0)) } ?? "nil"
-            let subs = (cv.layer?.sublayers ?? []).map { String(describing: type(of: $0)) }.joined(separator: ",")
-            cvDesc = "\(String(describing: type(of: cv)))[\(layerDesc){\(subs)}]"
-          } else {
-            cvDesc = "nil"
-          }
-          return "\(String(describing: type(of: w)))|vis=\(w.isVisible)|lvl=\(w.level.rawValue)|cv=\(cvDesc)"
+          "\(String(describing: type(of: w)))|vis=\(w.isVisible)|title='\(w.title)'"
         }.joined(separator: "\n    ")
-        Logger.log("oona: 窗口清单（\(NSApp.windows.count) 个）：\n    \(summary)", level: .debug, subsystem: subsystem)
+        Logger.log("oona: 窗口清单（\(NSApp.windows.count) 个，期望 '\(expectedTitle)'）：\n    \(summary)", level: .debug, subsystem: subsystem)
       }
       return
     }
-    Logger.log("oona: 找到 mpv 视频窗口（\(candidate.frame)），挂为下层子窗口", subsystem: subsystem)
+    Logger.log("oona: 找到 mpv 视频窗口 '\(expectedTitle)'（\(candidate.frame)）", subsystem: subsystem)
     mpvVideoWindow = candidate
     // mpv 可能随时销毁该窗口；防止窗口关闭时连带释放。
     candidate.isReleasedWhenClosed = false
-    candidate.styleMask = .borderless
-    candidate.backgroundColor = .black
-    playerWindow.addChildWindow(candidate, ordered: .below)
+    // 启动阶段先隐藏（播放器窗口加载后作为子窗口跟随显示）。
+    candidate.orderOut(nil)
+    // oona: mpv 窗口已创建 = vo 初始化完成（Metal 表面就绪），
+    // 放行主线程上延迟的 mpv 回调与初始化收尾。
+    player.mpv.markVideoReady()
+  }
+
+  /// 播放器窗口已加载且 mpv 窗口已找到时：挂为下层子窗口。
+  /// mpv 的窗口（含渲染视图/Metal 层/交换链）保持原样——搬动视图会断开
+  /// MoltenVK 呈现链路；子窗口 + 主窗口视频区透明化即可透出画面。
+  private func attachMPVVideoWindowIfPossible() {
+    guard let mpvWin = mpvVideoWindow, isWindowLoaded, let playerWindow = window else { return }
+    guard mpvWin.parent == nil else { return }  // 已挂载
+    Logger.log("oona: mpv 视频窗口挂为下层子窗口", subsystem: subsystem)
+    mpvWin.styleMask = .borderless
+    mpvWin.backgroundColor = .black
+    playerWindow.addChildWindow(mpvWin, ordered: .below)
     // 视频区域透明化：让下层子窗口的画面透过主窗口显示。
     enforceVideoAreaTransparency()
     syncMPVVideoWindowFrame()
-    // oona: 窗口已创建并接管 = vo 初始化完成，放行主线程上延迟的 mpv 回调。
-    player.mpv.markVideoReady()
   }
 
   /// 主窗口视频区域透明化（幂等；setMaterial 等路径可能重设背景色，需反复强调）。
@@ -730,6 +726,7 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
     let rectInWindow = videoView.convert(videoView.bounds, to: nil)
     let screenRect = playerWindow.convertToScreen(rectInWindow)
     if mpvWin.frame != screenRect {
+      Logger.log("oona: 同步子窗口 videoView=\(videoView.bounds) window=\(playerWindow.frame) → child=\(screenRect)（旧 \(mpvWin.frame)）", level: .debug, subsystem: subsystem)
       mpvWin.setFrame(screenRect, display: true)
     }
     // 顺带巩固透明状态（防止主题切换等路径重设背景色）。

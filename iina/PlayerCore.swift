@@ -535,6 +535,15 @@ class PlayerCore: NSObject {
   ///   - url: URL of the media to open.
   ///   - isNetwork: Whether the media must be streamed over the network.
   private func openMainWindow(path: String, url: URL, isNetwork: Bool) {
+    // oona: vo 仍在创建期间时（启动后约 1-2 秒），openMainWindow 内部对 mpv 的
+    // 同步读写（windowDidLoad 的 sidebar 初始化、getFlag 等）会与 vo 线程互相
+    // 等待（死锁）。整体推迟到 vo 就绪后再执行（通常延迟不足一秒，用户无感）。
+    if MPVController.useGPUNextOwnWindow, mpv.voInitializing {
+      mpv.runWhenVideoReady { [weak self] in
+        self?.openMainWindow(path: path, url: url, isNetwork: isNetwork)
+      }
+      return
+    }
     log("Opening \(path) in main window")
     info.currentURL = url
     info.mpvMd5 = Utility.mpvWatchLaterMd5(url, ignorePathInWatchLaterConfig)
@@ -576,37 +585,19 @@ class PlayerCore: NSObject {
 
     // Delay force-window until an actual file load to avoid Xcode-launched app startup hanging
     // while mpv tries to create a VO before IINA has entered its normal media-open path.
-    // oona: gpu-next 自建窗口模式下完全不设置 force-window——任何线程上的
-    // force-window 设置都会同步触发 vo 创建并持有 core 锁；播放尚未开始时这会与
-    // 主线程的 Metal 窗口初始化形成死锁。gpu-next 的窗口会在播放开始时由 mpv
-    // 核心线程自然创建（与独立 mpv 相同），再由 PlayerWindowController 托管。
-    if !MPVController.useGPUNextOwnWindow {
-      mpv.setString(MPVOption.Window.forceWindow, "yes", level: .verbose)
-    }
+    // oona: gpu-next 模式下 force-window=yes 已在 mpv 初始化前设置——vo 在启动时
+    // 由核心线程创建并全程存在，此处无需（也不能）再设置。
 
     // Send load file command
     info.justOpenedFile = true
     info.state = .loading
     if MPVController.useGPUNextOwnWindow {
-      // oona: gpu-next 自建窗口模式下的加载序列：
-      // 1) loadfile 走主队列——openMainWindow 内 windowDidLoad（含 sidebar 的
-      //    同步 mpv 属性读取）先于该 block 执行完毕；若在后台立即执行，vo 创建
-      //    会与 windowDidLoad 尚未完成的属性读取死锁（vo 线程等主线程 ↔
-      //    主线程等 core 锁）。
-      // 2) loadfile 在主线程上只是入队即返回，不会阻塞主线程；播放开始后 vo
-      //    由核心线程创建，Metal 表面创建需要主线程运行循环（届时已空闲）。
-      // 3) watch-later 恢复的暂停状态会让 mpv 不渲染首帧 → vo 不创建 → 托管
-      //    落空，故播放启动后 1.5s 取消暂停（尊重"打开时暂停"偏好）。此调用
-      //    可能落在 vo 初始化持锁窗口内，必须放后台线程等锁（主线程保持空闲）。
+      // oona: loadfile 走主队列，保证 openMainWindow 内 windowDidLoad 的同步
+      // mpv 属性读取（sidebar 初始化）先完成。loadfile 只是把文件入队即返回，
+      // 不会阻塞主线程；vo 已在启动时创建，不存在窗口创建竞态。
       DispatchQueue.main.async { [weak self] in
         guard let self, let mpv = self.mpv else { return }
         mpv.command(.loadfile, args: [path], level: .verbose)
-        if !Preference.bool(for: .pauseWhenOpen) {
-          DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            guard let self, let mpv = self.mpv else { return }
-            mpv.setFlag(MPVOption.PlaybackControl.pause, false, level: .verbose)
-          }
-        }
       }
     } else {
       mpv.command(.loadfile, args: [path], level: .verbose)
@@ -692,8 +683,25 @@ class PlayerCore: NSObject {
     }
 
     mpv.mpvInit()
-    events.emit(.mpvInitialized)
+    if MPVController.useGPUNextOwnWindow {
+      // oona: vo 由 force-window=yes 在启动时创建——立即开始监听 mpv 窗口，
+      // 找到即隐藏并放行 vo 门控（不触碰播放器窗口/nib）。
+      mainWindow.hostMPVVideoWindowIfNeeded()
+      // oona: mpvInitialized 事件监听者与音频设备检查都会在主线程上读写 mpv，
+      // vo 创建期间执行会与 vo 线程互相等待（死锁）。推迟到 vo 就绪后执行。
+      mpv.runWhenVideoReady { [weak self] in
+        guard let self else { return }
+        self.events.emit(.mpvInitialized)
+        self.setupAudioDevice()
+      }
+    } else {
+      events.emit(.mpvInitialized)
+      setupAudioDevice()
+    }
+  }
 
+  /// 音频设备选择与校正（原 startMPV 尾段；own-window 模式下推迟到 vo 就绪）。
+  private func setupAudioDevice() {
     let audioDevice = Preference.string(for: .audioDevice)!
     if !getAudioDevices().contains(where: { $0.name == audioDevice }) {
       log("Audio device configured in settings not found, will default to auto:\n  \(audioDevice)")

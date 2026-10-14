@@ -697,10 +697,11 @@ class MPVController: NSObject {
       mpv_observe_property(mpv, 0, k, v)
     }
 
-    // oona: gpu-next 相关选项必须在 initialize 之前设置。vo=gpu-next 的自建窗口
-    // 需要 MoltenVK 初始化 Metal 表面，必须发生在主线程可用的场合：因此这里
-    // 不设置 force-window（它会让 vo 在主线程执行 initialize 时立即创建并死锁），
-    // 让 vo 在播放开始时由 mpv 核心线程创建，再由 PlayerWindowController 托管。
+    // oona: gpu-next 相关选项必须在 initialize 之前设置。
+    // - force-window=yes（不是 immediate）：让 vo 在启动时由核心线程创建。
+    //   vo 一旦存在，之后任何主线程 mpv 访问都不再触发窗口创建，
+    //   "vo 线程等主线程建 Metal 表面 ↔ 主线程等 core 锁"的环形死锁连根拔起。
+    // - title 用于给每个核心的 mpv 窗口唯一标识，供托管扫描精确匹配。
     if Self.useGPUNextOwnWindow {
       chkErr(setOptionString(MPVOption.Video.vo, "gpu-next", level: .verbose))
       chkErr(setOptionString(MPVOption.Window.border, "no", level: .verbose))
@@ -715,16 +716,27 @@ class MPVController: NSObject {
       // 直接 pre-init 设置以避开偏好系统缓存的竞态。
       chkErr(setOptionString("slang", "zh,chi,zh-Hans,chs,sc,eng", level: .verbose))
       chkErr(setOptionString("sub-auto", "fuzzy", level: .verbose))
+      chkErr(setOptionString(MPVOption.Window.forceWindow, "yes", level: .verbose))
+      chkErr(setOptionString("title", "oona-mpv-\(player.playerNumber)", level: .verbose))
     }
     chkErr(mpv_initialize(mpv))
 
     if Self.useGPUNextOwnWindow {
       // oona: 初始化完成后进入 vo 初始化门控期：主线程上的 mpv 事件回调延迟派发，
-      // 直到 PlayerWindowController 接管到 mpv 视频窗口（或 20s 兜底超时）。
+      // 直到 PlayerWindowController 找到 mpv 视频窗口（或 20s 兜底超时）。
       voInitializing = true
       scheduleVideoReadyFailSafe()
+      // 其余初始化后设置推迟到 vo 就绪后执行（vo 创建期间主线程不得触碰 mpv）。
+      runWhenVideoReady { [weak self] in
+        self?.mpvPostInitAfterVOReady()
+      }
+      return
     }
+    mpvPostInitAfterVOReady()
+  }
 
+  /// mpv 初始化后的收尾设置。own-window 模式下由 vo 就绪门控调度执行。
+  private func mpvPostInitAfterVOReady() {
     // The option watch-later-options is not available until after the mpv instance is initialized.
     // Useful to log the value of this option as users often ask about what the Watch Later feature
     // remembers.
