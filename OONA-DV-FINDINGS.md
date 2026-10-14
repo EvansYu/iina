@@ -39,3 +39,24 @@ vo=gpu-next 建 Metal 表面必须回主线程，而 IINA 在主线程上同步�
 - /Applications/mpv.app（brew mpv 0.41 + gpu-next）：右键打开方式播放 DV，
   颜色正确、字幕自动简中，配置在 ~/.config/mpv/。
 - IINA 继续负责非 DV 视频。
+
+## 追记：vo-prewarm 架构（第 5 轮迭代）
+
+### 已验证可行
+- vo 在启动时由核心线程创建（force-window=yes pre-init + 主线程空闲服务窗口派发）
+- 每核心窗口标题 "oona-mpv-N" 精确匹配，托管 T+1s 完成
+- 子窗口挂载 + 几何同步（640x400 → videoView 矩形）正常
+
+### 第 5 个死锁变体（本架构仍未根治）
+门控冲刷的 fileStarted 回调在主线程调 getMediaTitle；此刻 core 处于
+play_current_file/load_external_opts 中，dispatch 队列状态阻塞外部 API——
+所有 mpv 线程空闲、主线程+IPC 永久卡在 mp_dispatch_lock（采样证实）。
+
+### 死锁分类学（5 个样本的共同根因）
+IINA 在主线程同步调用 mpv API（数十个入口：标题/侧栏/NowPlaying/事件回调…）
+× mpv mac-vo 在窗口创建/重配置期间需要主线程参与调度。
+门控只能延迟"事件驱动"的回调，无法覆盖直接调用入口。
+
+### 唯一根治路径
+把 IINA 的 mpv 访问层全面异步化（observe_property 缓存 + async 读），
+主线程永不等待 core 锁——即最初评估的"周级、多会话"重构。
