@@ -595,9 +595,9 @@ class PlayerCore: NSObject {
       // oona: loadfile 走主队列，保证 openMainWindow 内 windowDidLoad 的同步
       // mpv 属性读取（sidebar 初始化）先完成。loadfile 只是把文件入队即返回，
       // 不会阻塞主线程；vo 已在启动时创建，不存在窗口创建竞态。
-      // oona: RunLoop 原生调度（非主队列块）——保持主队列空闲，
-      // performMPVCall 的泵送才能排空 mpv 派发到主队列的窗口操作。
-      RunLoop.main.perform { [weak self] in
+      // oona: performSelector 运行循环源调度（非 GCD 主队列块）——保持主队列
+      // 空闲，performMPVCall 的泵送才能排空 mpv 派发到主队列的窗口操作。
+      MPVController.mainRunner.dispatch { [weak self] in
         guard let self, let mpv = self.mpv else { return }
         mpv.command(.loadfile, args: [path], level: .verbose)
       }

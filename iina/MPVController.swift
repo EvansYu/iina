@@ -113,11 +113,10 @@ class MPVController: NSObject {
 
   /// 在主线程上执行 `block`；vo 初始化期间则推迟到 vo 就绪后执行。
   func dispatchToMain(_ block: @escaping () -> Void) {
-    // oona: 用 RunLoop 原生调度而非 DispatchQueue.main.async——GCD 主队列
-    // 串行不可重入；若本块成为主队列块，块内 performMPVCall 的泵送将无法排空
-    // 主队列，mpv 的 MacCommon.config(dispatch_sync 到主队列) 永远无法完成
-    // （死锁）。RunLoop 调度不占用主队列，泵送可正常服务 mpv 的派发。
-    RunLoop.main.perform { [weak self] in
+    // oona: performSelector 走运行循环源（非 GCD 主队列）——主队列块内的
+    // 泵送调用无法排空队列（串行不可重入），mpv 的 dispatch_sync(主队列)
+    // 将永不完成。运行循环源上下文的泵送可正常服务 mpv 的派发（已验证）。
+    MPVController.mainRunner.dispatch { [weak self] in
       guard let self else { block(); return }
       self.runWhenVideoReady(block)
     }
@@ -141,13 +140,62 @@ class MPVController: NSObject {
     let blocks = pendingVideoReadyBlocks
     pendingVideoReadyBlocks = []
     log("oona: vo 就绪，冲刷 \(blocks.count) 个延迟的回调", level: .verbose)
-    blocks.forEach { RunLoop.main.perform($0) }
+    blocks.forEach { MPVController.mainRunner.dispatch($0) }
   }
 
   private func scheduleVideoReadyFailSafe() {
     // 兜底：纯音频等无视频窗口的场景，20s 后强制放行，避免 UI 永久延迟。
     voReadyFailSafeTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
       self?.markVideoReady()
+    }
+  }
+
+  // MARK: oona: 运行循环原生主线程调度器
+
+  /// 经 `performSelector(onMainThread:)` 在主线程执行块。
+  ///
+  /// 该机制走运行循环源（mach port），**不经过 GCD 主队列**——主队列串行不可
+  /// 重入，从主队列块内做的泵送无法排空队列，mpv 的 dispatch_sync(主队列)
+  /// 永不完成（死锁）。运行循环源上下文中的泵送可正常排空（最小复现已验证）。
+  /// 注意：`RunLoop.perform` 与 `DispatchQueue.main.async` 在现代 macOS 上
+  /// 均由 GCD 主队列支撑，不可用于此目的。
+  static let mainRunner = RunloopBlockRunner()
+
+  final class RunloopBlockRunner: NSObject {
+    private let lock = NSLock()
+    private var blocks: [Int: () -> Void] = [:]
+    private var nextId = 0
+
+    @objc private func run(_ idObj: NSNumber) {
+      lock.lock()
+      let block = blocks.removeValue(forKey: idObj.intValue)
+      lock.unlock()
+      guard let block else { return }
+      if Thread.current.threadDictionary["oona.pumping"] as? Bool == true {
+        // 正在 performMPVCall 的泵送中：立即执行会在持锁上下文里重入
+        // （已观测 trackListChanged → getTrackInfo 递归锁崩溃）。推迟到
+        // 泵送结束后再执行。
+        lock.lock()
+        let id = nextId
+        nextId += 1
+        blocks[id] = block
+        lock.unlock()
+        perform(#selector(run(_:)), on: Thread.main, with: NSNumber(value: id),
+                waitUntilDone: false, modes: [RunLoop.Mode.common.rawValue])
+        return
+      }
+      block()
+    }
+
+    func dispatch(_ block: @escaping () -> Void) {
+      // 一律排队（绝内联）——避免从任意调用点直接重入。
+      lock.lock()
+      let id = nextId
+      nextId += 1
+      blocks[id] = block
+      lock.unlock()
+      perform(#selector(run(_:)), on: Thread.main, with: NSNumber(value: id),
+              waitUntilDone: false, modes: [RunLoop.Mode.common.rawValue])
     }
   }
 
@@ -182,8 +230,11 @@ class MPVController: NSObject {
       result = work()
       done.signal()
     }
+    Thread.current.threadDictionary["oona.pumping"] = true
+    defer { Thread.current.threadDictionary["oona.pumping"] = false }
     while done.wait(timeout: .now()) == .timedOut {
       // 每片 50ms：服务主队列派发（mpv 窗口操作）与 AppKit 事件。
+      // 泵送期间 RunloopBlockRunner 的块会自动推迟（防重入崩溃）。
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
     }
     return result

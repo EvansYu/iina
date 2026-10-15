@@ -90,3 +90,30 @@ mpv 的 Swift 层（MacCommon）在 vo 重配置期间，持有 core 派发锁�
 - 本分支：完整的 4 代架构实现 + 死锁分类学（7 样本）
 - 用户可用方案：/Applications/mpv.app（DV 完美）+ IINA（日常）
 - 建议上游 issue：向 mpv 报告 libmpv+macvk+force-window 的 dispatch 卡死
+
+## 第二阶段研究（第 35 轮）：关键反转与新证据
+
+### 最小复现框架（other/oona-research/minitest.swift）
+dlopen libmpv + vo=gpu-next 自建窗口 + 可注入 IINA 行为特征（事件读取/
+属性观察/双实例/加载序列/读频率/泵送），带 --pump --queue-block 等开关。
+
+### 三个决定性实验结果
+1. **"mpv 内部 bug"结论被推翻**：最小 libmpv 程序 + vo=gpu-next 自建窗口
+   完全健康（含事件读取、观察、双实例、硬解、IINA 加载序列）。
+2. **卡死真变量 = 主线程读频率**：0.05s 间隔 100% 复现，0.2s 偶发。
+   与硬解无关（hwdec=no 同样卡）。
+3. **泵送（performMPVCall）机制本身有效**——但仅限"运行循环源"上下文：
+   - Timer/performSelector 上下文中的泵送读：健康 ✓
+   - GCD 主队列块中的泵送读：卡死 ✗（串行队列不可重入，无法排空）
+   注意：RunLoop.perform 在现代 macOS 上也是 GCD 主队列支撑，无效。
+
+### 泵送引入的新问题：重入崩溃
+泵送运行循环执行排队回调 → trackListChanged 重入 getTrackInfo →
+非递归锁递归获取 → SIGTRAP。已加"泵送期间推迟重入块"防护，但防护
+引入了新的调度级联，托管路径失灵（37s+）。
+
+### 剩余工作（明确但量大）
+1. IINA 的 NotificationCenter 观察者（queue:.main）与 DispatchQueue.main.async
+   调用点全部转为 performSelector 调度（数百处）
+2. 审计"持锁跨 mpv 调用"的代码（trackList 等）
+3. 或：等待 mpv 上游把 MacCommon.config 的 dispatch_sync 改异步
