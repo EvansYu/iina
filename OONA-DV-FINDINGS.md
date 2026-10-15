@@ -117,3 +117,20 @@ dlopen libmpv + vo=gpu-next 自建窗口 + 可注入 IINA 行为特征（事件�
    调用点全部转为 performSelector 调度（数百处）
 2. 审计"持锁跨 mpv 调用"的代码（trackList 等）
 3. 或：等待 mpv 上游把 MacCommon.config 的 dispatch_sync 改异步
+
+## 终局补充（第 36 轮）：系统对话框插曲与最终验证
+
+### 关键插曲
+build28 的崩溃使 macOS 记住"应用反复崩溃"，之后每次启动被
+`promptToIgnorePersistentState → NSAlert.runModal` 系统模态框阻塞
+（弹窗常被遮挡/在副屏，用户看不到）——第 32-35 轮的"启动失败"全是它，
+并非代码回归。换 bundle ID（app.oona.player2）+ NSSupportsPersistentWindowState=false 解决。
+
+### 最终验证（清除对话框干扰后）
+- 启动链完整：托管 1-2s 完成（找到窗口→挂载→几何同步）✓
+- vo reconfig 成功：`3840x2160 videotoolbox[p010] dolbyvision/bt.2020/pq` ✓
+- 但播放仍未启动：vo 线程卡 `MacCommon.config → dispatch_sync(主队列)`，
+  主线程在 syncUI Timer 泵送中——最小复现（Timer 泵送+0.05s 读）健康，
+  但 oona 完整复杂度（事件观察者风暴 + 多定时器 + 延迟盒机制）下仍死锁。
+- 结论不变：mpv 的 MacCommon.config 持 core 锁同步派发主队列是根因，
+  嵌入侧（泵送/门控/延迟盒/调度器）已穷尽，需 mpv 上游修复。

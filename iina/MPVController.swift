@@ -161,6 +161,11 @@ class MPVController: NSObject {
   /// 均由 GCD 主队列支撑，不可用于此目的。
   static let mainRunner = RunloopBlockRunner()
 
+  /// 泵送期间推迟的块容器（引用类型，供线程字典共享）。
+  final class DeferredBox {
+    var blocks: [() -> Void] = []
+  }
+
   final class RunloopBlockRunner: NSObject {
     private let lock = NSLock()
     private var blocks: [Int: () -> Void] = [:]
@@ -171,24 +176,26 @@ class MPVController: NSObject {
       let block = blocks.removeValue(forKey: idObj.intValue)
       lock.unlock()
       guard let block else { return }
-      if Thread.current.threadDictionary["oona.pumping"] as? Bool == true {
+      if Thread.current.threadDictionary["oona.pumping"] != nil {
         // 正在 performMPVCall 的泵送中：立即执行会在持锁上下文里重入
-        // （已观测 trackListChanged → getTrackInfo 递归锁崩溃）。推迟到
-        // 泵送结束后再执行。
-        lock.lock()
-        let id = nextId
-        nextId += 1
-        blocks[id] = block
-        lock.unlock()
-        perform(#selector(run(_:)), on: Thread.main, with: NSNumber(value: id),
-                waitUntilDone: false, modes: [RunLoop.Mode.common.rawValue])
+        // （已观测 trackListChanged → getTrackInfo 递归锁崩溃）。
+        // 放入延迟盒，由最外层泵送结束后统一放行（不可立即重排队——
+        // 重排队的 performSelector 会在泵送切片内再次触发，形成活锁）。
+        if let box = Thread.current.threadDictionary["oona.deferredBox"] as? DeferredBox {
+          box.blocks.append(block)
+        }
         return
       }
       block()
     }
 
     func dispatch(_ block: @escaping () -> Void) {
-      // 一律排队（绝内联）——避免从任意调用点直接重入。
+      // 主线程直通（保持原 DispatchQueue.main.async 的内联时序语义，
+      // 启动路径依赖它）；泵送期间到达的块由 run() 推迟到延迟盒。
+      if Thread.isMainThread, Thread.current.threadDictionary["oona.pumping"] == nil {
+        block()
+        return
+      }
       lock.lock()
       let id = nextId
       nextId += 1
@@ -230,11 +237,24 @@ class MPVController: NSObject {
       result = work()
       done.signal()
     }
+    // 嵌套感知：只有最外层泵送负责清理标记与放行延迟块。
+    let isOutermost = Thread.current.threadDictionary["oona.pumping"] == nil
     Thread.current.threadDictionary["oona.pumping"] = true
-    defer { Thread.current.threadDictionary["oona.pumping"] = false }
+    if isOutermost {
+      Thread.current.threadDictionary["oona.deferredBox"] = DeferredBox()
+    }
+    defer {
+      if isOutermost {
+        Thread.current.threadDictionary.removeObject(forKey: "oona.pumping")
+        if let box = Thread.current.threadDictionary.removeObject(forKey: "oona.deferredBox") as? DeferredBox {
+          box.blocks.forEach { Self.mainRunner.dispatch($0) }
+        }
+      }
+    }
     while done.wait(timeout: .now()) == .timedOut {
       // 每片 50ms：服务主队列派发（mpv 窗口操作）与 AppKit 事件。
-      // 泵送期间 RunloopBlockRunner 的块会自动推迟（防重入崩溃）。
+      // 泵送期间 RunloopBlockRunner 的块进入延迟盒（防重入崩溃），
+      // 最外层泵送结束后统一放行。
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
     }
     return result
