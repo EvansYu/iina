@@ -402,7 +402,7 @@ struct Preference {
     case playlist = 1
     case seek = 2
 
-    static var defaultValue = ArrowButtonAction.speed
+    static var defaultValue = ArrowButtonAction.seek
 
     init?(key: Key) {
       self.init(rawValue: Preference.integer(for: key))
@@ -1088,7 +1088,7 @@ struct Preference {
     .osdAutoHideTimeout: Float(1),
     .osdTextSize: Float(20),
     .softVolume: 100,
-    .arrowButtonAction: ArrowButtonAction.speed.rawValue,
+    .arrowButtonAction: ArrowButtonAction.defaultValue.rawValue,
     .pauseWhenOpen: false,
     .fullScreenWhenOpen: false,
     .useLegacyFullScreen: false,
@@ -1150,7 +1150,8 @@ struct Preference {
     .hardwareDecoder: HardwareDecoderOption.auto.rawValue,
     .forceDedicatedGPU: false,
     .loadIccProfile: true,
-    .enableHdrSupport: true,
+    // The embedded renderer is validated for SDR output; HDR remains opt-in.
+    .enableHdrSupport: false,
     .enableToneMapping: true,
     .toneMappingTargetPeak: 0,
     .enableToneMappingTargetPeakOverride: false,

@@ -14,3 +14,6 @@ DEBUG_INFORMATION_FORMAT = dwarf-with-dsym
 ENABLE_NS_ASSERTIONS = NO
 MTL_ENABLE_DEBUG_INFO = NO
 SWIFT_COMPILATION_MODE = wholemodule
+
+// Keep the media closure minimal, but retain Sparkle for classes loaded from NIBs.
+OTHER_LDFLAGS = $(inherited) -Wl,-dead_strip_dylibs -Wl,-needed_framework,Sparkle

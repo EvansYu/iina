@@ -53,8 +53,7 @@ class VideoView: NSView {
   }
 
   override var isOpaque: Bool {
-    // oona: gpu-next 自建窗口模式下，此视图必须透明，以透出下层子窗口中的视频画面。
-    return !MPVController.useGPUNextOwnWindow
+    return true
   }
 
   // MARK: - Init
@@ -64,16 +63,10 @@ class VideoView: NSView {
     super.init(frame: frame)
 
     // set up layer
-    if MPVController.useGPUNextOwnWindow {
-      // oona: 视频由 mpv 自建窗口（托管为下层子窗口）呈现，此视图保持透明。
-      wantsLayer = true
-      layer?.backgroundColor = NSColor.clear.cgColor
-    } else {
-      layer = videoLayer
-      videoLayer.colorspace = VideoView.SRGB
-      videoLayer.contentsScale = NSScreen.main!.backingScaleFactor
-      wantsLayer = true
-    }
+    layer = videoLayer
+    videoLayer.colorspace = VideoView.SRGB
+    videoLayer.contentsScale = NSScreen.main!.backingScaleFactor
+    wantsLayer = true
 
     // other settings
     autoresizingMask = [.width, .height]
@@ -99,12 +92,6 @@ class VideoView: NSView {
     $isUninited.withWriteLock() { isUninited in
       guard !isUninited else { return }
       isUninited = true
-
-      // oona: gpu-next 自建窗口模式下，先从视图层级移除重挂载进来的 mpv 视图，
-      // 再销毁 mpv（防止 mpv 销毁窗口时连带释放仍在本层级中的视图）。
-      if MPVController.useGPUNextOwnWindow && Thread.isMainThread {
-        subviews.forEach { $0.removeFromSuperview() }
-      }
 
       stopDisplayLink()
       player.mpv.mpvUninitRendering()
@@ -321,92 +308,19 @@ class VideoView: NSView {
     RunLoop.current.add(displayIdleTimer!, forMode: .default)
   }
 
-#if !USE_ICC_PROFILE_AUTO
-  private func findProfilePath() -> String? {
-    guard let displayId = currentDisplay,
-          let uuid = CGDisplayCreateUUIDFromDisplayID(displayId)?.takeRetainedValue() else {
-      return nil
-    }
-    typealias ProfileData = (uuid: CFUUID, profileUrl: URL?)
-    var argResult: ProfileData = (uuid, nil)
-    withUnsafeMutablePointer(to: &argResult) { data in
-      ColorSyncIterateDeviceProfiles({ (dict: CFDictionary?, ptr: UnsafeMutableRawPointer?) -> Bool in
-        if let info = dict as? [String: Any], let current = info["DeviceProfileIsCurrent"] as? Int {
-          let deviceID = info["DeviceID"] as! CFUUID
-          let ptr = ptr!.bindMemory(to: ProfileData.self, capacity: 1)
-          let uuid = ptr.pointee.uuid
-          if current == 1, deviceID == uuid {
-            let profileURL = info["DeviceProfileURL"] as! URL
-            ptr.pointee.profileUrl = profileURL
-            return false
-          }
-        }
-        return true
-      }, data)
-    }
-    guard let iccProfilePath = argResult.profileUrl?.path,
-          FileManager.default.fileExists(atPath: iccProfilePath) else {
-      return nil
-    }
-    return iccProfilePath
-  }
-#endif
-
-  /// Set the ICC profile and adjust the view layer.
-  /// - Important: IINA should be using the mpv
-  ///     [icc-profile-auto](https://mpv.io/manual/stable/#options-icc-profile-auto) option because that allows
-  ///     users to make use of the mpv [icc-profile](https://mpv.io/manual/stable/#options-icc-profile) option
-  ///     in their `mpv.conf` file since setting that option overrides `icc-profile-auto`. But `icc-profile-auto` is not
-  ///     working as reported in mpv issue [#17385](https://github.com/mpv-player/mpv/issues/17385). Until that
-  ///     problem is fixed, IINA must go back to using `icc-profile`. The code to support `icc-profile-auto` can be
-  ///     enabled by setting `USE_ICC_PROFILE_AUTO` in Xcode settings to test a proposed fix to `libmpv`.
-  private func setICCProfile() {
-    let screenColorSpace = player.mainWindow.window?.screen?.colorSpace
-    if !Preference.bool(for: .loadIccProfile) {
-      logHDR("Not using ICC profile due to user preference")
-#if USE_ICC_PROFILE_AUTO
-      player.mpv.setFlag(MPVOption.GPURendererOptions.iccProfileAuto, false)
-#else
-      player.mpv.setString(MPVOption.GPURendererOptions.iccProfile, "")
-#endif
-    } else {
-#if USE_ICC_PROFILE_AUTO
-      if let screenColorSpace {
-        let name = screenColorSpace.localizedName ?? "unnamed"
-        logHDR("Using the ICC profile of the color space \(name)")
-        // Set MPV_RENDER_PARAM_ICC_PROFILE before enabling icc-profile-auto to true as mpv requires
-        // that parameter be set in the render context when icc-profile-auto is in use.
-        videoLayer.setRenderICCProfile(screenColorSpace)
-        player.mpv.setFlag(MPVOption.GPURendererOptions.iccProfileAuto, true)
-      } else {
-        logHDR("Failed find ICC profile to load", level: .error)
-        player.mpv.setFlag(MPVOption.GPURendererOptions.iccProfileAuto, false)
-      }
-#else
-      if let iccProfilePath = findProfilePath() {
-        logHDR("Loading ICC profile: \(iccProfilePath)")
-        player.mpv.setString(MPVOption.GPURendererOptions.iccProfile, iccProfilePath)
-      } else {
-        logHDR("Failed to find ICC profile to load", level: .error)
-        player.mpv.setString(MPVOption.GPURendererOptions.iccProfile, "")
-      }
-#endif
-    }
-
-    let sdrColorSpace = screenColorSpace?.cgColorSpace ?? VideoView.SRGB
-    if videoLayer.colorspace != sdrColorSpace {
-      let name: String = {
-        if let name = sdrColorSpace.name { return name as String }
-        if let screenColorSpace, let name = screenColorSpace.localizedName { return name }
-        return "Unspecified"
-      }()
-      log("Setting layer color space to \(name)")
-      videoLayer.colorspace = sdrColorSpace
-      videoLayer.wantsExtendedDynamicRangeContent = false
-      player.mpv.setString(MPVOption.GPURendererOptions.targetTrc, "auto")
-      player.mpv.setString(MPVOption.GPURendererOptions.targetPrim, "auto")
-      player.mpv.setFlag(MPVOption.Screenshot.screenshotTagColorspace, false)
-    }
+  /// Configure SDR output for ColorSync compositing by Core Animation.
+  private func configureSDROutput() {
+    // The pinned gpu-next render backend does not implement ICC profiles. Render
+    // into tagged sRGB and let ColorSync convert to the destination display.
+    // Tagging these pixels with the display profile would apply the wrong transform.
+    player.mpv.setFlag(MPVOption.GPURendererOptions.iccProfileAuto, false)
+    player.mpv.setString(MPVOption.GPURendererOptions.iccProfile, "")
+    player.mpv.setString(MPVOption.GPURendererOptions.targetTrc, "srgb")
+    player.mpv.setString(MPVOption.GPURendererOptions.targetPrim, "bt.709")
+    player.mpv.setFlag(MPVOption.Screenshot.screenshotTagColorspace, true)
+    videoLayer.colorspace = VideoView.SRGB
+    videoLayer.wantsExtendedDynamicRangeContent = false
+    logHDR("Using sRGB output with system display color management")
   }
 
   // MARK: - Error Logging
@@ -502,7 +416,7 @@ extension VideoView {
       player.info.hdrAvailable = edrAvailable
       player.postNotification(.iinaHDRChanged)
     }
-    if edrEnabled != true { setICCProfile() }
+    if edrEnabled != true { configureSDROutput() }
   }
 
   /// Returns `true` if the video being played is a HDR video.

@@ -1,0 +1,117 @@
+--- a/video/out/gpu_next/libmpv_gpu_next.c
++++ b/video/out/gpu_next/libmpv_gpu_next.c
+@@ -159,16 +159,6 @@
+                         const struct pl_source_frame *src)
+ {
+     struct mp_image *mpi = src->frame_data;
+-    struct frame_priv *fp = mpi->priv;
+-    struct priv *p = fp->p;
+-
+-    for (int i = 0; i < MAX_OSD_PARTS; i++) {
+-        pl_tex t = p->osd_state.entries[i].tex;
+-        if (t)
+-            MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, t);
+-        p->osd_state.entries[i].tex = NULL;
+-    }
+-
+     talloc_free(mpi);
+ }
+ 
+@@ -400,7 +390,14 @@
+         return;
+     }
+ 
+-    struct pl_frame src_frame = {0};
++    mp_image_params_guess_csp(&mpi->params);
++    struct pl_frame src_frame = {
++        .color = mpi->params.color,
++        .repr = mpi->params.repr,
++        .rotation = mpi->params.rotate / 90,
++        .crop = { 0, 0, mpi->w, mpi->h },
++    };
++    pl_tex textures[4] = {0};
+     struct pl_plane_data data[4] = {0};
+     src_frame.num_planes = plane_data_from_imgfmt(data, &src_frame.repr.bits,
+                                                   mpi->imgfmt, false);
+@@ -411,21 +408,18 @@
+     if (!src_frame.num_planes)
+         goto done;
+ 
+-    src_frame.color    = mpi->params.color;
+-    src_frame.repr     = mpi->params.repr;
+-    src_frame.rotation = mpi->params.rotate / 90;
+-    src_frame.crop     = (struct pl_rect2df) { 0, 0, mpi->w, mpi->h };
+-
+-    mp_image_params_guess_csp(&mpi->params);
+-    src_frame.color = mpi->params.color;
+-    src_frame.repr  = mpi->params.repr;
+-
+     for (int i = 0; i < src_frame.num_planes; i++) {
+         data[i].width      = mp_image_plane_w(mpi, i);
+         data[i].height     = mp_image_plane_h(mpi, i);
+-        data[i].pixels     = mpi->planes[i];
+-        data[i].row_stride = mpi->stride[i];
+-        if (!pl_upload_plane(p->ctx->gpu, &src_frame.planes[i], NULL, &data[i]))
++        if (mpi->stride[i] < 0) {
++            data[i].pixels = mpi->planes[i] + (data[i].height - 1) * mpi->stride[i];
++            data[i].row_stride = -mpi->stride[i];
++            src_frame.planes[i].flipped = true;
++        } else {
++            data[i].pixels = mpi->planes[i];
++            data[i].row_stride = mpi->stride[i];
++        }
++        if (!pl_upload_plane(p->ctx->gpu, &src_frame.planes[i], &textures[i], &data[i]))
+             goto cleanup_planes;
+     }
+ 
+@@ -440,7 +434,15 @@
+         .color           = pl_color_space_srgb,
+     };
+ 
+-    pl_render_image(p->renderer, &src_frame, &target, &pl_render_default_params);
++    if (args->subs || args->osd) {
++        int flags = (!args->subs ? OSD_DRAW_OSD_ONLY : 0) |
++                    (!args->osd ? OSD_DRAW_SUB_ONLY : 0);
++        update_overlays(p, (struct mp_osd_res) {
++            .w = mpi->w, .h = mpi->h, .display_par = 1.0,
++        }, flags, PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, mpi->pts);
++    }
++    if (!pl_render_image(p->renderer, &src_frame, &target, &pl_render_default_params))
++        goto cleanup_planes;
+ 
+     struct mp_image *res = mp_image_alloc(IMGFMT_RGBA, mpi->w, mpi->h);
+     if (res) {
+@@ -453,12 +455,16 @@
+             talloc_free(res);
+             res = NULL;
+         }
++        if (res) {
++            res->params.color = target.color;
++            res->params.repr = target.repr;
++        }
+         args->res = res;
+     }
+ 
+ cleanup_planes:
+     for (int i = 0; i < src_frame.num_planes; i++)
+-        pl_tex_destroy(p->ctx->gpu, &src_frame.planes[i].texture);
++        pl_tex_destroy(p->ctx->gpu, &textures[i]);
+ done:
+     pl_tex_destroy(p->ctx->gpu, &fbo);
+ }
+@@ -824,13 +830,8 @@
+     struct pl_frame_mix mix = {0};
+     pl_queue_update(p->queue, &mix, pl_queue_params(.pts = pts));
+ 
+-    // signatures derived from user_data (mp_image *) pointers.
+-    uint64_t sigs[64] = {0};
+-    int num_frames = MPMIN(mix.num_frames, MP_ARRAY_SIZE(sigs));
+-    for (int i = 0; i < num_frames; i++)
+-        sigs[i] = (uintptr_t) mix.frames[i]->user_data;
+-    mix.signatures = sigs;
+-    mix.num_frames = num_frames;
++    // Keep the queue's unique signatures: allocator addresses can be reused
++    // while libplacebo still has cached output for an earlier frame.
+ 
+     // map_frame() leaves crop zeroed; set it now to avoid degenerate GLSL.
+     // Cast away const — we own the frames through user_data.

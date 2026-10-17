@@ -446,9 +446,6 @@ class MainWindowController: PlayerWindowController {
     super.windowDidLoad()
     MemoryUsage.shared.logUsage("after window loaded")
 
-    // oona: 开始扫描 mpv（vo=gpu-next）自建的视频窗口并托管为下层子窗口。
-    hostMPVVideoWindowIfNeeded()
-
     guard let window, let cv = window.contentView else { return }
 
     window.styleMask.insert(.fullSizeContentView)
@@ -1498,8 +1495,6 @@ class MainWindowController: PlayerWindowController {
   ///     [willEnterFullScreenNotification](https://developer.apple.com/documentation/appkit/nswindow/willenterfullscreennotification).
   func windowWillEnterFullScreen(_ notification: Notification) {
     log("Entering full screen mode")
-    // oona: 全屏动画期间淡出 mpv 子窗口，避免跨步感。
-    mpvChildWindowWillTransition()
     // When playback is paused the display link is stopped in order to avoid wasting energy on
     // needless processing. It must be running while transitioning to full screen mode.
     videoView.displayActive()
@@ -1536,8 +1531,6 @@ class MainWindowController: PlayerWindowController {
   ///     [didEnterFullScreenNotification](https://developer.apple.com/documentation/appkit/nswindow/didenterfullscreennotification).
   func windowDidEnterFullScreen(_ notification: Notification) {
     log("Entered full screen mode")
-    // oona: 全屏落位——mpv 子窗口精确对齐后淡入。
-    mpvChildWindowDidTransition()
     fsState.finishAnimating()
 
     titleTextField?.alphaValue = 1
@@ -1634,8 +1627,6 @@ class MainWindowController: PlayerWindowController {
   ///     [willExitFullScreenNotification](https://developer.apple.com/documentation/appkit/nswindow/willexitfullscreennotification).
   func windowWillExitFullScreen(_ notification: Notification) {
     log("Exiting full screen mode")
-    // oona: 退出全屏动画期间淡出 mpv 子窗口。
-    mpvChildWindowWillTransition()
     // When playback is paused the display link is stopped in order to avoid wasting energy on
     // needless processing. It must be running while transitioning from full screen mode.
     videoView.displayActive()
@@ -1672,8 +1663,6 @@ class MainWindowController: PlayerWindowController {
   ///     [didExitFullScreenNotification](https://developer.apple.com/documentation/appkit/nswindow/didexitfullscreennotification).
   func windowDidExitFullScreen(_ notification: Notification) {
     log("Exited full screen mode")
-    // oona: 退出全屏落位——mpv 子窗口精确对齐后淡入。
-    mpvChildWindowDidTransition()
 
     if fsState.isFullscreen {
       // IINA should not be in full screen mode at this point. The fsState should indicate IINA is
@@ -1942,7 +1931,6 @@ class MainWindowController: PlayerWindowController {
 
   func windowDidResize(_ notification: Notification) {
     guard loaded, let window else { return }
-    syncMPVVideoWindowFrame()
     if !window.inLiveResize {
       liveText.requestAnalysis()
     }
@@ -2016,7 +2004,6 @@ class MainWindowController: PlayerWindowController {
   // MARK: - Window delegate: Activeness status
   func windowDidMove(_ notification: Notification) {
     guard loaded, let window else { return }
-    syncMPVVideoWindowFrame()
     player.events.emit(.windowMoved, data: window.frame)
   }
 
@@ -2807,6 +2794,9 @@ class MainWindowController: PlayerWindowController {
     if arrowBtnFunction == .playlist {
       leftArrowButton.image = #imageLiteral(resourceName: "nextl")
       rightArrowButton.image = #imageLiteral(resourceName: "nextr")
+    } else if arrowBtnFunction == .seek {
+      leftArrowButton.image = NSImage(systemSymbolName: "gobackward.10", accessibilityDescription: nil)
+      rightArrowButton.image = NSImage(systemSymbolName: "goforward.10", accessibilityDescription: nil)
     } else {
       leftArrowButton.image = #imageLiteral(resourceName: "speedl")
       rightArrowButton.image = #imageLiteral(resourceName: "speed")
@@ -2947,7 +2937,7 @@ class MainWindowController: PlayerWindowController {
       player.navigateInPlaylist(nextMedia: !left)
 
     case .seek:
-      player.seek(relativeSecond: left ? -10 : 10, option: .relative)
+      player.seek(relativeSecond: left ? -10 : 10, option: .exact)
 
     }
   }

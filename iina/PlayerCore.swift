@@ -535,15 +535,6 @@ class PlayerCore: NSObject {
   ///   - url: URL of the media to open.
   ///   - isNetwork: Whether the media must be streamed over the network.
   private func openMainWindow(path: String, url: URL, isNetwork: Bool) {
-    // oona: vo 仍在创建期间时（启动后约 1-2 秒），openMainWindow 内部对 mpv 的
-    // 同步读写（windowDidLoad 的 sidebar 初始化、getFlag 等）会与 vo 线程互相
-    // 等待（死锁）。整体推迟到 vo 就绪后再执行（通常延迟不足一秒，用户无感）。
-    if MPVController.useGPUNextOwnWindow, mpv.voInitializing {
-      mpv.runWhenVideoReady { [weak self] in
-        self?.openMainWindow(path: path, url: url, isNetwork: isNetwork)
-      }
-      return
-    }
     log("Opening \(path) in main window")
     info.currentURL = url
     info.mpvMd5 = Utility.mpvWatchLaterMd5(url, ignorePathInWatchLaterConfig)
@@ -585,25 +576,12 @@ class PlayerCore: NSObject {
 
     // Delay force-window until an actual file load to avoid Xcode-launched app startup hanging
     // while mpv tries to create a VO before IINA has entered its normal media-open path.
-    // oona: gpu-next 模式下 force-window=yes 已在 mpv 初始化前设置——vo 在启动时
-    // 由核心线程创建并全程存在，此处无需（也不能）再设置。
+    mpv.setString(MPVOption.Window.forceWindow, "yes", level: .verbose)
 
     // Send load file command
     info.justOpenedFile = true
     info.state = .loading
-    if MPVController.useGPUNextOwnWindow {
-      // oona: loadfile 走主队列，保证 openMainWindow 内 windowDidLoad 的同步
-      // mpv 属性读取（sidebar 初始化）先完成。loadfile 只是把文件入队即返回，
-      // 不会阻塞主线程；vo 已在启动时创建，不存在窗口创建竞态。
-      // oona: performSelector 运行循环源调度（非 GCD 主队列块）——保持主队列
-      // 空闲，performMPVCall 的泵送才能排空 mpv 派发到主队列的窗口操作。
-      MPVController.mainRunner.dispatch { [weak self] in
-        guard let self, let mpv = self.mpv else { return }
-        mpv.command(.loadfile, args: [path], level: .verbose)
-      }
-    } else {
-      mpv.command(.loadfile, args: [path], level: .verbose)
-    }
+    mpv.command(.loadfile, args: [path], level: .verbose)
 
     if Preference.bool(for: .autoRepeat) {
        let loopMode = Preference.DefaultRepeatMode(rawValue: Preference.integer(for: .defaultRepeatMode))
@@ -685,25 +663,8 @@ class PlayerCore: NSObject {
     }
 
     mpv.mpvInit()
-    if MPVController.useGPUNextOwnWindow {
-      // oona: vo 由 force-window=yes 在启动时创建——立即开始监听 mpv 窗口，
-      // 找到即隐藏并放行 vo 门控（不触碰播放器窗口/nib）。
-      mainWindow.hostMPVVideoWindowIfNeeded()
-      // oona: mpvInitialized 事件监听者与音频设备检查都会在主线程上读写 mpv，
-      // vo 创建期间执行会与 vo 线程互相等待（死锁）。推迟到 vo 就绪后执行。
-      mpv.runWhenVideoReady { [weak self] in
-        guard let self else { return }
-        self.events.emit(.mpvInitialized)
-        self.setupAudioDevice()
-      }
-    } else {
-      events.emit(.mpvInitialized)
-      setupAudioDevice()
-    }
-  }
+    events.emit(.mpvInitialized)
 
-  /// 音频设备选择与校正（原 startMPV 尾段；own-window 模式下推迟到 vo 就绪）。
-  private func setupAudioDevice() {
     let audioDevice = Preference.string(for: .audioDevice)!
     if !getAudioDevices().contains(where: { $0.name == audioDevice }) {
       log("Audio device configured in settings not found, will default to auto:\n  \(audioDevice)")
@@ -714,18 +675,11 @@ class PlayerCore: NSObject {
   func initVideo() {
     // init mpv render context.
     mpv.mpvInitRendering()
-    if !MPVController.useGPUNextOwnWindow {
-      // `force-window=immediate` makes audio-only subtitle rendering work with `vo=libmpv`,
-      // but setting it before render initialization can race the VO thread against IINA's
-      // render context setup. Switch to `immediate` only after the render context exists.
-      // oona: gpu-next 自建窗口模式下禁止在主线程设置此选项——它会立即在主线程上
-      // 创建 vo 并与主线程互相等待（死锁）。该选项已在 mpv 初始化前设置。
-      mpv.setString(MPVOption.Window.forceWindow, "immediate", level: .verbose)
-    }
-    // oona: gpu-next 自建窗口模式无 GL 渲染，display link 无用武之地。
-    if !MPVController.useGPUNextOwnWindow {
-      mainWindow.videoView.startDisplayLink()
-    }
+    // `force-window=immediate` makes audio-only subtitle rendering work with `vo=libmpv`,
+    // but setting it before render initialization can race the VO thread against IINA's
+    // render context setup. Switch to `immediate` only after the render context exists.
+    mpv.setString(MPVOption.Window.forceWindow, "immediate", level: .verbose)
+    mainWindow.videoView.startDisplayLink()
     log("Initialized rendering")
     MemoryUsage.shared.logUsage("after rendering initialized")
   }
